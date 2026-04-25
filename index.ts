@@ -22,6 +22,15 @@ interface TelegramConfig {
 	botId?: number;
 	allowedUserId?: number;
 	lastUpdateId?: number;
+	verbose?: boolean;
+	streamAssistantText?: boolean;
+	streamTelemetry?: boolean;
+	streamToolCalls?: boolean;
+	streamBash?: boolean;
+	streamStdout?: boolean;
+	showElapsed?: boolean;
+	showTokenUsage?: boolean;
+	telemetryIntervalMs?: number;
 }
 
 interface TelegramApiResponse<T> {
@@ -160,6 +169,36 @@ interface TelegramMediaGroupState {
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
+type TelegramTelemetryStatus =
+	| "queued"
+	| "running"
+	| "tool"
+	| "bash"
+	| "streaming"
+	| "completed"
+	| "aborted"
+	| "error";
+
+interface TelegramTelemetryState {
+	startedAt: number;
+	status: TelegramTelemetryStatus;
+	telemetryMessageId?: number;
+	lastEditAt: number;
+	lastText?: string;
+	activeTool?: string;
+	activeCommand?: string;
+	recentStdout?: string[];
+	recentStderr?: string[];
+	inputTokens?: number;
+	outputTokens?: number;
+	contextTokens?: number;
+	contextWindowTokens?: number;
+	errorMessage?: string;
+	showElapsed?: boolean;
+	showTokenUsage?: boolean;
+	flushTimer?: ReturnType<typeof setInterval>;
+}
+
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const LOCK_PATH = join(homedir(), ".pi", "agent", "telegram.lock");
@@ -170,6 +209,10 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
+const DEFAULT_TELEMETRY_INTERVAL_MS = 1000;
+const MAX_TELEMETRY_OUTPUT_LINES = 8;
+const MAX_TELEMETRY_COMMAND_LENGTH = 600;
+const MAX_TELEMETRY_ERROR_LENGTH = 900;
 
 const SYSTEM_PROMPT_SUFFIX = `
 
@@ -224,6 +267,108 @@ function formatTokens(count: number): string {
 	if (count < 1000000) return `${Math.round(count / 1000)}k`;
 	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
 	return `${Math.round(count / 1000000)}M`;
+}
+
+function formatElapsed(ms: number): string {
+	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+	const seconds = totalSeconds % 60;
+	const minutes = Math.floor(totalSeconds / 60) % 60;
+	const hours = Math.floor(totalSeconds / 3600);
+	const pad = (value: number): string => value.toString().padStart(2, "0");
+	if (hours > 0) return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+	return `${pad(minutes)}:${pad(seconds)}`;
+}
+
+function truncateTelemetryText(text: string, maxLength: number): string {
+	const normalized = text.replace(/\r\n/g, "\n").trim();
+	if (normalized.length <= maxLength) return normalized;
+	return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+function appendRecentLines(
+	existing: string[] | undefined,
+	text: string,
+): string[] {
+	const lines = text
+		.replace(/\r\n/g, "\n")
+		.split("\n")
+		.map((line) => line.trimEnd())
+		.filter((line) => line.length > 0);
+	return [...(existing ?? []), ...lines].slice(-MAX_TELEMETRY_OUTPUT_LINES);
+}
+
+function getTextContent(value: unknown): string {
+	const content = (value as { content?: unknown })?.content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((block) => {
+			if (
+				typeof block === "object" &&
+				block !== null &&
+				(block as { type?: unknown }).type === "text" &&
+				typeof (block as { text?: unknown }).text === "string"
+			) {
+				return (block as { text: string }).text;
+			}
+			return "";
+		})
+		.join("");
+}
+
+function formatTelemetry(state: TelegramTelemetryState): string {
+	const lines: string[] = [];
+	if (state.status === "completed") lines.push("✅ completed");
+	else if (state.status === "aborted") lines.push("🛑 aborted");
+	else if (state.status === "error") lines.push("❌ error");
+	else if (state.status === "queued") lines.push("🟢 pi run started");
+
+	if (state.showElapsed !== false) {
+		lines.push(`⏱ ${formatElapsed(Date.now() - state.startedAt)}`);
+	}
+
+	if (!["completed", "aborted", "error"].includes(state.status)) {
+		lines.push(`📍 status: ${state.status}`);
+	}
+
+	if (state.status !== "aborted" && state.status !== "error") {
+		if (state.activeTool) {
+			lines.push(
+				state.activeTool === "bash" ? "🛠 bash" : `🛠 tool: ${state.activeTool}`,
+			);
+		}
+		if (state.activeCommand) {
+			lines.push(
+				`$ ${truncateTelemetryText(state.activeCommand, MAX_TELEMETRY_COMMAND_LENGTH)}`,
+			);
+		}
+		if (state.recentStdout?.length) {
+			lines.push("📤 stdout", ...state.recentStdout);
+		}
+		if (state.recentStderr?.length) {
+			lines.push("📥 stderr", ...state.recentStderr);
+		}
+		if (state.showTokenUsage !== false) {
+			const context =
+				state.contextTokens !== undefined &&
+				state.contextWindowTokens !== undefined
+					? `${formatTokens(state.contextTokens)} / ${formatTokens(state.contextWindowTokens)}`
+					: "unknown";
+			lines.push(`🧠 context: ${context}`);
+			const output =
+				state.outputTokens !== undefined
+					? `${formatTokens(state.outputTokens)} tokens`
+					: "unknown";
+			lines.push(`🔢 output: ${output}`);
+		}
+	}
+
+	if (state.status === "error" && state.errorMessage) {
+		lines.push(
+			truncateTelemetryText(state.errorMessage, MAX_TELEMETRY_ERROR_LENGTH),
+		);
+	}
+
+	return lines.join("\n").slice(0, MAX_MESSAGE_LENGTH);
 }
 
 function chunkParagraphs(text: string): string[] {
@@ -318,7 +463,174 @@ export default function (pi: ExtensionAPI) {
 	let nextDraftId = 0;
 	let pairingCode: string | undefined;
 	let hasPollingLock = false;
+	let telemetryState: TelegramTelemetryState | undefined;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
+
+	function isVerboseTelemetryEnabled(): boolean {
+		return config.verbose === true;
+	}
+
+	function shouldStreamAssistantText(): boolean {
+		return config.streamAssistantText !== false;
+	}
+
+	function shouldStreamTelemetry(): boolean {
+		return config.streamTelemetry ?? isVerboseTelemetryEnabled();
+	}
+
+	function shouldStreamToolCalls(): boolean {
+		return config.streamToolCalls ?? isVerboseTelemetryEnabled();
+	}
+
+	function shouldStreamBash(): boolean {
+		return config.streamBash ?? isVerboseTelemetryEnabled();
+	}
+
+	function shouldStreamStdout(): boolean {
+		return config.streamStdout === true;
+	}
+
+	function shouldShowElapsed(): boolean {
+		return config.showElapsed ?? isVerboseTelemetryEnabled();
+	}
+
+	function shouldShowTokenUsage(): boolean {
+		return config.showTokenUsage ?? isVerboseTelemetryEnabled();
+	}
+
+	function getTelemetryIntervalMs(): number {
+		const value = config.telemetryIntervalMs;
+		return typeof value === "number" && value > 0
+			? value
+			: DEFAULT_TELEMETRY_INTERVAL_MS;
+	}
+
+	function getVerboseStatusText(): string {
+		return [
+			`verbose: ${isVerboseTelemetryEnabled() ? "on" : "off"}`,
+			`streamAssistantText: ${shouldStreamAssistantText()}`,
+			`streamTelemetry: ${shouldStreamTelemetry()}`,
+			`streamToolCalls: ${shouldStreamToolCalls()}`,
+			`streamBash: ${shouldStreamBash()}`,
+			`streamStdout: ${shouldStreamStdout()}`,
+			`showElapsed: ${shouldShowElapsed()}`,
+			`showTokenUsage: ${shouldShowTokenUsage()}`,
+			`telemetryIntervalMs: ${getTelemetryIntervalMs()}`,
+		].join("\n");
+	}
+
+	async function setVerboseTelemetry(enabled: boolean): Promise<void> {
+		config = {
+			...config,
+			verbose: enabled,
+			streamTelemetry: enabled,
+			streamToolCalls: enabled,
+			streamBash: enabled,
+			showElapsed: enabled,
+			showTokenUsage: enabled,
+		};
+		await writeConfig(config);
+	}
+
+	function updateTelemetryUsage(ctx: ExtensionContext): void {
+		if (!telemetryState || !shouldShowTokenUsage()) return;
+		const usage = ctx.getContextUsage();
+		if (usage) {
+			telemetryState.contextTokens = usage.tokens ?? undefined;
+			telemetryState.contextWindowTokens = usage.contextWindow;
+		} else if (ctx.model?.contextWindow) {
+			telemetryState.contextWindowTokens = ctx.model.contextWindow;
+		}
+	}
+
+	function updateTelemetryUsageFromMessage(message: AgentMessage): void {
+		if (!telemetryState || !shouldShowTokenUsage()) return;
+		const usage = (
+			message as unknown as { usage?: { input?: number; output?: number } }
+		).usage;
+		if (!usage) return;
+		if (typeof usage.input === "number")
+			telemetryState.inputTokens = usage.input;
+		if (typeof usage.output === "number")
+			telemetryState.outputTokens = usage.output;
+	}
+
+	async function flushTelemetry(chatId: number, force = false): Promise<void> {
+		const state = telemetryState;
+		if (!state || !shouldStreamTelemetry()) return;
+		const now = Date.now();
+		if (!force && now - state.lastEditAt < getTelemetryIntervalMs()) return;
+		const text = formatTelemetry(state);
+		if (text === state.lastText) return;
+		try {
+			if (state.telemetryMessageId === undefined) {
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+					chat_id: chatId,
+					text,
+				});
+				state.telemetryMessageId = sent.message_id;
+			} else {
+				await callTelegram("editMessageText", {
+					chat_id: chatId,
+					message_id: state.telemetryMessageId,
+					text,
+				});
+			}
+			state.lastText = text;
+			state.lastEditAt = now;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (!message.toLowerCase().includes("message is not modified")) {
+				state.lastEditAt = now;
+			}
+		}
+	}
+
+	function scheduleTelemetryTimer(chatId: number): void {
+		const state = telemetryState;
+		if (!state || state.flushTimer || !shouldStreamTelemetry()) return;
+		state.flushTimer = setInterval(() => {
+			void flushTelemetry(chatId);
+		}, getTelemetryIntervalMs());
+	}
+
+	async function startTelemetry(
+		turn: ActiveTelegramTurn,
+		ctx: ExtensionContext,
+	): Promise<void> {
+		if (!shouldStreamTelemetry()) return;
+		telemetryState = {
+			startedAt: Date.now(),
+			status: "queued",
+			lastEditAt: 0,
+			showElapsed: shouldShowElapsed(),
+			showTokenUsage: shouldShowTokenUsage(),
+		};
+		updateTelemetryUsage(ctx);
+		await flushTelemetry(turn.chatId, true);
+		scheduleTelemetryTimer(turn.chatId);
+	}
+
+	async function finishTelemetry(
+		turn: ActiveTelegramTurn,
+		status: "completed" | "aborted" | "error",
+		ctx: ExtensionContext,
+		errorMessage?: string,
+	): Promise<void> {
+		const state = telemetryState;
+		if (!state) return;
+		if (state.flushTimer) clearInterval(state.flushTimer);
+		state.flushTimer = undefined;
+		state.status = status;
+		state.activeTool = undefined;
+		state.activeCommand = undefined;
+		state.recentStdout = undefined;
+		state.recentStderr = undefined;
+		state.errorMessage = errorMessage;
+		updateTelemetryUsage(ctx);
+		await flushTelemetry(turn.chatId, true);
+		telemetryState = undefined;
+	}
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -987,6 +1299,34 @@ export default function (pi: ExtensionAPI) {
 				.find((text) => text.length > 0) || "";
 		const lower = rawText.toLowerCase();
 
+		if (lower.startsWith("/telegram-verbose")) {
+			const action = lower.split(/\s+/)[1] ?? "status";
+			if (action === "on") {
+				await setVerboseTelemetry(true);
+				await sendTextReply(
+					firstMessage.chat.id,
+					firstMessage.message_id,
+					`Verbose Telegram telemetry enabled.\n\n${getVerboseStatusText()}`,
+				);
+				return;
+			}
+			if (action === "off") {
+				await setVerboseTelemetry(false);
+				await sendTextReply(
+					firstMessage.chat.id,
+					firstMessage.message_id,
+					`Verbose Telegram telemetry disabled.\n\n${getVerboseStatusText()}`,
+				);
+				return;
+			}
+			await sendTextReply(
+				firstMessage.chat.id,
+				firstMessage.message_id,
+				getVerboseStatusText(),
+			);
+			return;
+		}
+
 		if (lower === "stop" || lower === "/stop") {
 			if (currentAbort) {
 				if (queuedTelegramTurns.length > 0) {
@@ -1106,7 +1446,7 @@ export default function (pi: ExtensionAPI) {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, /stop. Pairing is managed from pi with /telegram-reset-pairing.`,
+				`Send me a message and I will forward it to pi. Commands: /status, /compact, /stop, /telegram-verbose on|off|status. Pairing is managed from pi with /telegram-reset-pairing.`,
 			);
 			return;
 		}
@@ -1219,7 +1559,8 @@ export default function (pi: ExtensionAPI) {
 					{ offset: -1, limit: 1, timeout: 0 },
 					{ signal },
 				);
-				const last = updates.at(-1);
+				const last =
+					updates.length > 0 ? updates[updates.length - 1] : undefined;
 				if (last) {
 					config.lastUpdateId = last.update_id;
 					await writeConfig(config);
@@ -1356,6 +1697,30 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("telegram-verbose", {
+		description: "Enable, disable, or show verbose Telegram telemetry settings",
+		handler: async (args, ctx) => {
+			const action = args.trim().toLowerCase();
+			if (action === "on") {
+				await setVerboseTelemetry(true);
+				ctx.ui.notify(
+					`Verbose Telegram telemetry enabled. ${getVerboseStatusText().replace(/\n/g, " | ")}`,
+					"info",
+				);
+				return;
+			}
+			if (action === "off") {
+				await setVerboseTelemetry(false);
+				ctx.ui.notify(
+					`Verbose Telegram telemetry disabled. ${getVerboseStatusText().replace(/\n/g, " | ")}`,
+					"info",
+				);
+				return;
+			}
+			ctx.ui.notify(getVerboseStatusText().replace(/\n/g, " | "), "info");
+		},
+	});
+
 	pi.registerCommand("telegram-reset-pairing", {
 		description: "Forget the allowed Telegram user and show a new pairing code",
 		handler: async (_args, ctx) => {
@@ -1417,6 +1782,8 @@ export default function (pi: ExtensionAPI) {
 		if (activeTelegramTurn) {
 			await clearPreview(activeTelegramTurn.chatId);
 		}
+		if (telemetryState?.flushTimer) clearInterval(telemetryState.flushTimer);
+		telemetryState = undefined;
 		activeTelegramTurn = undefined;
 		currentAbort = undefined;
 		preserveQueuedTurnsAsHistory = false;
@@ -1438,12 +1805,19 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
 				activeTelegramTurn = { ...nextTurn };
-				previewState = {
-					mode: draftSupport === "unsupported" ? "message" : "draft",
-					pendingText: "",
-					lastSentText: "",
-				};
+				if (shouldStreamAssistantText()) {
+					previewState = {
+						mode: draftSupport === "unsupported" ? "message" : "draft",
+						pendingText: "",
+						lastSentText: "",
+					};
+				}
 				startTypingLoop(ctx);
+				await startTelemetry(activeTelegramTurn, ctx);
+				if (telemetryState) {
+					telemetryState.status = "running";
+					await flushTelemetry(activeTelegramTurn.chatId, true);
+				}
 			}
 		}
 		updateStatus(ctx);
@@ -1451,6 +1825,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("message_start", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
+		if (telemetryState) {
+			telemetryState.status = "streaming";
+			void flushTelemetry(activeTelegramTurn.chatId);
+		}
+		if (!shouldStreamAssistantText()) return;
 		if (
 			previewState &&
 			(previewState.pendingText.trim().length > 0 ||
@@ -1465,8 +1844,15 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("message_update", async (event, _ctx) => {
+	pi.on("message_update", async (event, ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
+		updateTelemetryUsage(ctx);
+		updateTelemetryUsageFromMessage(event.message);
+		if (telemetryState) {
+			telemetryState.status = "streaming";
+			void flushTelemetry(activeTelegramTurn.chatId);
+		}
+		if (!shouldStreamAssistantText()) return;
 		if (!previewState) {
 			previewState = {
 				mode: draftSupport === "unsupported" ? "message" : "draft",
@@ -1478,6 +1864,68 @@ export default function (pi: ExtensionAPI) {
 		schedulePreviewFlush(activeTelegramTurn.chatId);
 	});
 
+	pi.on("message_end", async (event, ctx) => {
+		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
+		updateTelemetryUsage(ctx);
+		updateTelemetryUsageFromMessage(event.message);
+	});
+
+	pi.on("tool_execution_start", async (event, ctx) => {
+		if (!activeTelegramTurn || !telemetryState) return;
+		if (!shouldStreamToolCalls()) return;
+		if (event.toolName === "bash" && !shouldStreamBash()) return;
+		updateTelemetryUsage(ctx);
+		telemetryState.status = event.toolName === "bash" ? "bash" : "tool";
+		telemetryState.activeTool = event.toolName;
+		telemetryState.activeCommand =
+			event.toolName === "bash" && typeof event.args?.command === "string"
+				? event.args.command
+				: undefined;
+		telemetryState.recentStdout = undefined;
+		telemetryState.recentStderr = undefined;
+		await flushTelemetry(activeTelegramTurn.chatId, true);
+	});
+
+	pi.on("tool_execution_update", async (event, ctx) => {
+		if (!activeTelegramTurn || !telemetryState) return;
+		if (!shouldStreamToolCalls()) return;
+		if (event.toolName === "bash" && !shouldStreamBash()) return;
+		updateTelemetryUsage(ctx);
+		telemetryState.status = event.toolName === "bash" ? "bash" : "tool";
+		telemetryState.activeTool = event.toolName;
+		if (event.toolName === "bash" && typeof event.args?.command === "string") {
+			telemetryState.activeCommand = event.args.command;
+		}
+		if (event.toolName === "bash" && shouldStreamStdout()) {
+			const text = getTextContent(event.partialResult);
+			if (text)
+				telemetryState.recentStdout = appendRecentLines(undefined, text);
+		}
+		void flushTelemetry(activeTelegramTurn.chatId);
+	});
+
+	pi.on("tool_execution_end", async (event, ctx) => {
+		if (!activeTelegramTurn || !telemetryState) return;
+		if (!shouldStreamToolCalls()) return;
+		if (event.toolName === "bash" && !shouldStreamBash()) return;
+		updateTelemetryUsage(ctx);
+		telemetryState.status = "running";
+		telemetryState.activeTool = event.toolName;
+		if (event.toolName !== "bash") {
+			telemetryState.activeCommand = undefined;
+		}
+		if (event.isError) {
+			const text = getTextContent(event.result);
+			if (text)
+				telemetryState.recentStderr = appendRecentLines(undefined, text);
+		}
+		await flushTelemetry(activeTelegramTurn.chatId, true);
+		if (!event.isError) {
+			telemetryState.activeTool = undefined;
+			telemetryState.activeCommand = undefined;
+		}
+	});
+
 	pi.on("agent_end", async (event, ctx) => {
 		const turn = activeTelegramTurn;
 		currentAbort = undefined;
@@ -1486,13 +1934,25 @@ export default function (pi: ExtensionAPI) {
 		updateStatus(ctx);
 		if (!turn) return;
 
+		for (const message of event.messages) {
+			if (isAssistantMessage(message)) updateTelemetryUsageFromMessage(message);
+		}
+
 		const assistant = extractAssistantText(event.messages);
 		if (assistant.stopReason === "aborted") {
 			await clearPreview(turn.chatId);
+			await finishTelemetry(turn, "aborted", ctx);
 			return;
 		}
 		if (assistant.stopReason === "error") {
 			await clearPreview(turn.chatId);
+			await finishTelemetry(
+				turn,
+				"error",
+				ctx,
+				assistant.errorMessage ||
+					"Telegram bridge: pi failed while processing the request.",
+			);
 			await sendTextReply(
 				turn.chatId,
 				turn.replyToMessageId,
@@ -1530,6 +1990,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		await sendQueuedAttachments(turn);
+		await finishTelemetry(turn, "completed", ctx);
 
 		if (queuedTelegramTurns.length > 0 && !preserveQueuedTurnsAsHistory) {
 			const nextTurn = queuedTelegramTurns[0];

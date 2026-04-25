@@ -149,12 +149,71 @@ The extension streams assistant text previews back to Telegram while pi is gener
 
 It tries Telegram draft streaming first with `sendMessageDraft`. If that is not supported for your bot, it falls back to `sendMessage` plus `editMessageText`.
 
+## Verbose telemetry
+
+Verbose mode adds a second, separate live Telegram message for each Telegram-triggered pi turn. It does **not** mix telemetry into the assistant answer stream, and it does **not** show private chain-of-thought. It only shows observable runtime telemetry exposed by pi's extension APIs.
+
+Enable it from pi or from the paired Telegram DM:
+
+```text
+/telegram-verbose on
+/telegram-verbose off
+/telegram-verbose status
+```
+
+Verbose settings are persisted in:
+
+```text
+~/.pi/agent/telegram.json
+```
+
+Supported settings:
+
+```json
+{
+  "verbose": true,
+  "streamAssistantText": true,
+  "streamTelemetry": true,
+  "streamToolCalls": true,
+  "streamBash": true,
+  "streamStdout": true,
+  "showElapsed": true,
+  "showTokenUsage": true,
+  "telemetryIntervalMs": 1000
+}
+```
+
+Defaults are conservative: `verbose` is off, assistant text streaming is on, telemetry is off unless verbose is enabled, tool/bash visibility follows verbose mode, stdout streaming is off unless explicitly enabled, and telemetry edits are throttled to 1000 ms.
+
+Example live telemetry message:
+
+```text
+⏱ 00:18
+📍 status: bash
+🛠 bash
+$ npm test
+🧠 context: 41.2k / 65.5k
+🔢 output: 884 tokens
+```
+
+Final telemetry looks like:
+
+```text
+✅ completed
+⏱ 00:31
+🧠 context: 41.7k / 65.5k
+🔢 output: 1.2k tokens
+```
+
+Token/context/tool visibility depends on what pi exposes at runtime. If a value is not available, the bridge shows `unknown` or omits that section rather than inventing data. Bash stdout/stderr snippets are truncated to the last few lines and bot tokens are never shown in telemetry, status, or errors.
+
 ## Commands
 
 - `/telegram-setup` — configure or validate the bot token
 - `/telegram-connect` — start polling in this pi session, if the single-session lock is free
 - `/telegram-disconnect` — stop polling and release the single-session lock
 - `/telegram-status` — show bot, pairing, polling, lock, and queue status
+- `/telegram-verbose on|off|status` — configure verbose Telegram telemetry
 - `/telegram-reset-pairing` — forget the allowed Telegram user and show a new pairing code
 
 ## Notes
