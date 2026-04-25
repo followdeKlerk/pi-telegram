@@ -179,18 +179,24 @@ type TelegramTelemetryStatus =
 	| "aborted"
 	| "error";
 
+interface TelegramTelemetryToolEntry {
+	name: string;
+	command?: string;
+	status: "running" | "done" | "error";
+}
+
 interface TelegramTelemetryState {
 	startedAt: number;
 	status: TelegramTelemetryStatus;
 	telemetryMessageId?: number;
 	lastEditAt: number;
 	lastText?: string;
-	activeTool?: string;
-	activeCommand?: string;
+	toolHistory?: TelegramTelemetryToolEntry[];
 	recentStdout?: string[];
 	recentStderr?: string[];
 	inputTokens?: number;
 	outputTokens?: number;
+	assistantOutputChars?: number;
 	contextTokens?: number;
 	contextWindowTokens?: number;
 	errorMessage?: string;
@@ -211,7 +217,8 @@ const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
 const DEFAULT_TELEMETRY_INTERVAL_MS = 1000;
 const MAX_TELEMETRY_OUTPUT_LINES = 8;
-const MAX_TELEMETRY_COMMAND_LENGTH = 600;
+const MAX_TELEMETRY_TOOL_HISTORY = 3;
+const MAX_TELEMETRY_TREE_COMMAND_LENGTH = 120;
 const MAX_TELEMETRY_ERROR_LENGTH = 900;
 
 const SYSTEM_PROMPT_SUFFIX = `
@@ -297,6 +304,25 @@ function appendRecentLines(
 	return [...(existing ?? []), ...lines].slice(-MAX_TELEMETRY_OUTPUT_LINES);
 }
 
+function estimateTokensFromCharCount(charCount: number): number {
+	return Math.max(1, Math.ceil(charCount / 4));
+}
+
+function formatToolHistoryEntry(
+	entry: TelegramTelemetryToolEntry,
+	isLast: boolean,
+): string {
+	const branch = isLast ? "└─" : "├─";
+	let status = "✓";
+	if (entry.status === "running") status = "▶";
+	else if (entry.status === "error") status = "✗";
+	const label = entry.name === "bash" ? "bash" : `tool: ${entry.name}`;
+	const command = entry.command
+		? ` — $ ${truncateTelemetryText(entry.command, MAX_TELEMETRY_TREE_COMMAND_LENGTH)}`
+		: "";
+	return `${branch} ${status} ${label}${command}`;
+}
+
 function getTextContent(value: unknown): string {
 	const content = (value as { content?: unknown })?.content;
 	if (!Array.isArray(content)) return "";
@@ -331,14 +357,13 @@ function formatTelemetry(state: TelegramTelemetryState): string {
 	}
 
 	if (state.status !== "aborted" && state.status !== "error") {
-		if (state.activeTool) {
+		const toolHistory = state.toolHistory;
+		if (toolHistory?.length) {
 			lines.push(
-				state.activeTool === "bash" ? "🛠 bash" : `🛠 tool: ${state.activeTool}`,
-			);
-		}
-		if (state.activeCommand) {
-			lines.push(
-				`$ ${truncateTelemetryText(state.activeCommand, MAX_TELEMETRY_COMMAND_LENGTH)}`,
+				"🧰 tools",
+				...toolHistory.map((entry, index) =>
+					formatToolHistoryEntry(entry, index === toolHistory.length - 1),
+				),
 			);
 		}
 		if (state.recentStdout?.length) {
@@ -354,10 +379,16 @@ function formatTelemetry(state: TelegramTelemetryState): string {
 					? `${formatTokens(state.contextTokens)} / ${formatTokens(state.contextWindowTokens)}`
 					: "unknown";
 			lines.push(`🧠 context: ${context}`);
-			const output =
-				state.outputTokens !== undefined
-					? `${formatTokens(state.outputTokens)} tokens`
-					: "unknown";
+			let output = "unknown";
+			if (state.outputTokens) {
+				output = `${formatTokens(state.outputTokens)} tokens`;
+			} else if (state.assistantOutputChars) {
+				const estimatedOutputTokens = estimateTokensFromCharCount(
+					state.assistantOutputChars,
+				);
+				const suffix = state.status === "streaming" ? " streaming" : "";
+				output = `~${formatTokens(estimatedOutputTokens)} tokens${suffix}`;
+			}
 			lines.push(`🔢 output: ${output}`);
 		}
 	}
@@ -519,15 +550,39 @@ export default function (pi: ExtensionAPI) {
 		].join("\n");
 	}
 
+	function formatVerboseStatusReply(
+		prefix = "Verbose Telegram telemetry status",
+	): string {
+		return `${prefix}.\n\n${getVerboseStatusText()}`;
+	}
+
+	function parseTelegramVerboseAction(
+		rawText: string,
+	): "on" | "off" | "status" | "unknown" {
+		const parts = rawText.trim().toLowerCase().split(/\s+/).filter(Boolean);
+		const command = parts[0] ?? "";
+		const commandName = command.split("@")[0];
+		if (commandName !== "/telegram-verbose") return "unknown";
+		const action = parts[1] ?? "status";
+		if (["on", "enable", "enabled", "true", "1"].includes(action)) return "on";
+		if (["off", "disable", "disabled", "false", "0"].includes(action))
+			return "off";
+		if (["status", "show", "get", ""].includes(action)) return "status";
+		return "unknown";
+	}
+
 	async function setVerboseTelemetry(enabled: boolean): Promise<void> {
 		config = {
 			...config,
 			verbose: enabled,
+			streamAssistantText: true,
 			streamTelemetry: enabled,
 			streamToolCalls: enabled,
 			streamBash: enabled,
+			streamStdout: enabled,
 			showElapsed: enabled,
 			showTokenUsage: enabled,
+			telemetryIntervalMs: DEFAULT_TELEMETRY_INTERVAL_MS,
 		};
 		await writeConfig(config);
 	}
@@ -551,8 +606,29 @@ export default function (pi: ExtensionAPI) {
 		if (!usage) return;
 		if (typeof usage.input === "number")
 			telemetryState.inputTokens = usage.input;
-		if (typeof usage.output === "number")
+		if (typeof usage.output === "number" && usage.output > 0)
 			telemetryState.outputTokens = usage.output;
+	}
+
+	function pushTelemetryTool(name: string, command: string | undefined): void {
+		if (!telemetryState) return;
+		const history = telemetryState.toolHistory ?? [];
+		telemetryState.toolHistory = [
+			...history,
+			{ name, command, status: "running" as const },
+		].slice(-MAX_TELEMETRY_TOOL_HISTORY);
+	}
+
+	function finishTelemetryTool(name: string, isError: boolean): void {
+		if (!telemetryState?.toolHistory?.length) return;
+		const history = telemetryState.toolHistory;
+		for (let index = history.length - 1; index >= 0; index--) {
+			const entry = history[index];
+			if (entry.name === name && entry.status === "running") {
+				entry.status = isError ? "error" : "done";
+				return;
+			}
+		}
 	}
 
 	async function flushTelemetry(chatId: number, force = false): Promise<void> {
@@ -622,8 +698,6 @@ export default function (pi: ExtensionAPI) {
 		if (state.flushTimer) clearInterval(state.flushTimer);
 		state.flushTimer = undefined;
 		state.status = status;
-		state.activeTool = undefined;
-		state.activeCommand = undefined;
 		state.recentStdout = undefined;
 		state.recentStderr = undefined;
 		state.errorMessage = errorMessage;
@@ -1299,30 +1373,30 @@ export default function (pi: ExtensionAPI) {
 				.find((text) => text.length > 0) || "";
 		const lower = rawText.toLowerCase();
 
-		if (lower.startsWith("/telegram-verbose")) {
-			const action = lower.split(/\s+/)[1] ?? "status";
-			if (action === "on") {
+		const verboseAction = parseTelegramVerboseAction(rawText);
+		if (verboseAction !== "unknown") {
+			if (verboseAction === "on") {
 				await setVerboseTelemetry(true);
 				await sendTextReply(
 					firstMessage.chat.id,
 					firstMessage.message_id,
-					`Verbose Telegram telemetry enabled.\n\n${getVerboseStatusText()}`,
+					formatVerboseStatusReply("Verbose Telegram telemetry enabled"),
 				);
 				return;
 			}
-			if (action === "off") {
+			if (verboseAction === "off") {
 				await setVerboseTelemetry(false);
 				await sendTextReply(
 					firstMessage.chat.id,
 					firstMessage.message_id,
-					`Verbose Telegram telemetry disabled.\n\n${getVerboseStatusText()}`,
+					formatVerboseStatusReply("Verbose Telegram telemetry disabled"),
 				);
 				return;
 			}
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				getVerboseStatusText(),
+				formatVerboseStatusReply(),
 			);
 			return;
 		}
@@ -1700,11 +1774,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("telegram-verbose", {
 		description: "Enable, disable, or show verbose Telegram telemetry settings",
 		handler: async (args, ctx) => {
-			const action = args.trim().toLowerCase();
+			const action = parseTelegramVerboseAction(`/telegram-verbose ${args}`);
 			if (action === "on") {
 				await setVerboseTelemetry(true);
 				ctx.ui.notify(
-					`Verbose Telegram telemetry enabled. ${getVerboseStatusText().replace(/\n/g, " | ")}`,
+					formatVerboseStatusReply(
+						"Verbose Telegram telemetry enabled",
+					).replace(/\n/g, " | "),
 					"info",
 				);
 				return;
@@ -1712,12 +1788,14 @@ export default function (pi: ExtensionAPI) {
 			if (action === "off") {
 				await setVerboseTelemetry(false);
 				ctx.ui.notify(
-					`Verbose Telegram telemetry disabled. ${getVerboseStatusText().replace(/\n/g, " | ")}`,
+					formatVerboseStatusReply(
+						"Verbose Telegram telemetry disabled",
+					).replace(/\n/g, " | "),
 					"info",
 				);
 				return;
 			}
-			ctx.ui.notify(getVerboseStatusText().replace(/\n/g, " | "), "info");
+			ctx.ui.notify(formatVerboseStatusReply().replace(/\n/g, " | "), "info");
 		},
 	});
 
@@ -1850,6 +1928,9 @@ export default function (pi: ExtensionAPI) {
 		updateTelemetryUsageFromMessage(event.message);
 		if (telemetryState) {
 			telemetryState.status = "streaming";
+			telemetryState.assistantOutputChars = getMessageText(
+				event.message,
+			).length;
 			void flushTelemetry(activeTelegramTurn.chatId);
 		}
 		if (!shouldStreamAssistantText()) return;
@@ -1868,6 +1949,11 @@ export default function (pi: ExtensionAPI) {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
 		updateTelemetryUsage(ctx);
 		updateTelemetryUsageFromMessage(event.message);
+		if (telemetryState) {
+			telemetryState.assistantOutputChars = getMessageText(
+				event.message,
+			).length;
+		}
 	});
 
 	pi.on("tool_execution_start", async (event, ctx) => {
@@ -1876,11 +1962,11 @@ export default function (pi: ExtensionAPI) {
 		if (event.toolName === "bash" && !shouldStreamBash()) return;
 		updateTelemetryUsage(ctx);
 		telemetryState.status = event.toolName === "bash" ? "bash" : "tool";
-		telemetryState.activeTool = event.toolName;
-		telemetryState.activeCommand =
+		const command =
 			event.toolName === "bash" && typeof event.args?.command === "string"
 				? event.args.command
 				: undefined;
+		pushTelemetryTool(event.toolName, command);
 		telemetryState.recentStdout = undefined;
 		telemetryState.recentStderr = undefined;
 		await flushTelemetry(activeTelegramTurn.chatId, true);
@@ -1892,10 +1978,6 @@ export default function (pi: ExtensionAPI) {
 		if (event.toolName === "bash" && !shouldStreamBash()) return;
 		updateTelemetryUsage(ctx);
 		telemetryState.status = event.toolName === "bash" ? "bash" : "tool";
-		telemetryState.activeTool = event.toolName;
-		if (event.toolName === "bash" && typeof event.args?.command === "string") {
-			telemetryState.activeCommand = event.args.command;
-		}
 		if (event.toolName === "bash" && shouldStreamStdout()) {
 			const text = getTextContent(event.partialResult);
 			if (text)
@@ -1910,20 +1992,13 @@ export default function (pi: ExtensionAPI) {
 		if (event.toolName === "bash" && !shouldStreamBash()) return;
 		updateTelemetryUsage(ctx);
 		telemetryState.status = "running";
-		telemetryState.activeTool = event.toolName;
-		if (event.toolName !== "bash") {
-			telemetryState.activeCommand = undefined;
-		}
+		finishTelemetryTool(event.toolName, event.isError);
 		if (event.isError) {
 			const text = getTextContent(event.result);
 			if (text)
 				telemetryState.recentStderr = appendRecentLines(undefined, text);
 		}
 		await flushTelemetry(activeTelegramTurn.chatId, true);
-		if (!event.isError) {
-			telemetryState.activeTool = undefined;
-			telemetryState.activeCommand = undefined;
-		}
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
@@ -1935,7 +2010,12 @@ export default function (pi: ExtensionAPI) {
 		if (!turn) return;
 
 		for (const message of event.messages) {
-			if (isAssistantMessage(message)) updateTelemetryUsageFromMessage(message);
+			if (isAssistantMessage(message)) {
+				updateTelemetryUsageFromMessage(message);
+				if (telemetryState) {
+					telemetryState.assistantOutputChars = getMessageText(message).length;
+				}
+			}
 		}
 
 		const assistant = extractAssistantText(event.messages);
