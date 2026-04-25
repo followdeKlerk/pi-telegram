@@ -1,10 +1,19 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import {
+	mkdir,
+	open,
+	readFile,
+	stat,
+	unlink,
+	writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
-
-import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
+import { basename, extname, join } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+} from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 interface TelegramConfig {
@@ -153,6 +162,8 @@ interface TelegramMediaGroupState {
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
+const LOCK_PATH = join(homedir(), ".pi", "agent", "telegram.lock");
+const ENV_BOT_TOKEN = "PI_TELEGRAM_BOT_TOKEN";
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
@@ -176,7 +187,10 @@ function sanitizeFileName(name: string): string {
 	return name.replace(/[^a-zA-Z0-9._-]+/g, "_");
 }
 
-function guessExtensionFromMime(mimeType: string | undefined, fallback: string): string {
+function guessExtensionFromMime(
+	mimeType: string | undefined,
+	fallback: string,
+): string {
 	if (!mimeType) return fallback;
 	const normalized = mimeType.toLowerCase();
 	if (normalized === "image/jpeg") return ".jpg";
@@ -231,7 +245,8 @@ function chunkParagraphs(text: string): string[] {
 		const lineChunks: string[] = [];
 		let lineCurrent = "";
 		for (const line of lines) {
-			const candidate = lineCurrent.length === 0 ? line : `${lineCurrent}\n${line}`;
+			const candidate =
+				lineCurrent.length === 0 ? line : `${lineCurrent}\n${line}`;
 			if (candidate.length <= MAX_MESSAGE_LENGTH) {
 				lineCurrent = candidate;
 				continue;
@@ -281,7 +296,11 @@ async function readConfig(): Promise<TelegramConfig> {
 
 async function writeConfig(config: TelegramConfig): Promise<void> {
 	await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
-	await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", "utf8");
+	await writeFile(
+		CONFIG_PATH,
+		JSON.stringify(config, null, "\t") + "\n",
+		"utf8",
+	);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -297,6 +316,8 @@ export default function (pi: ExtensionAPI) {
 	let previewState: TelegramPreviewState | undefined;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
+	let pairingCode: string | undefined;
+	let hasPollingLock = false;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 
 	function allocateDraftId(): number {
@@ -308,27 +329,72 @@ export default function (pi: ExtensionAPI) {
 		const theme = ctx.ui.theme;
 		const label = theme.fg("accent", "telegram");
 		if (error) {
-			ctx.ui.setStatus("telegram", `${label} ${theme.fg("error", "error")} ${theme.fg("muted", error)}`);
+			ctx.ui.setStatus(
+				"telegram",
+				`${label} ${theme.fg("error", "error")} ${theme.fg("muted", error)}`,
+			);
 			return;
 		}
-		if (!config.botToken) {
-			ctx.ui.setStatus("telegram", `${label} ${theme.fg("muted", "not configured")}`);
+		if (!getBotToken()) {
+			ctx.ui.setStatus(
+				"telegram",
+				`${label} ${theme.fg("muted", "not configured")}`,
+			);
 			return;
 		}
 		if (!pollingPromise) {
-			ctx.ui.setStatus("telegram", `${label} ${theme.fg("muted", "disconnected")}`);
+			ctx.ui.setStatus(
+				"telegram",
+				`${label} ${theme.fg("muted", hasPollingLock ? "disconnecting" : "disconnected")}`,
+			);
 			return;
 		}
 		if (!config.allowedUserId) {
-			ctx.ui.setStatus("telegram", `${label} ${theme.fg("warning", "awaiting pairing")}`);
+			ctx.ui.setStatus(
+				"telegram",
+				`${label} ${theme.fg("warning", `pair with /pair ${ensurePairingCode()}`)}`,
+			);
 			return;
 		}
 		if (activeTelegramTurn || queuedTelegramTurns.length > 0) {
-			const queued = queuedTelegramTurns.length > 0 ? theme.fg("muted", ` +${queuedTelegramTurns.length} queued`) : "";
-			ctx.ui.setStatus("telegram", `${label} ${theme.fg("accent", "processing")}${queued}`);
+			const queued =
+				queuedTelegramTurns.length > 0
+					? theme.fg("muted", ` +${queuedTelegramTurns.length} queued`)
+					: "";
+			ctx.ui.setStatus(
+				"telegram",
+				`${label} ${theme.fg("accent", "processing")}${queued}`,
+			);
 			return;
 		}
-		ctx.ui.setStatus("telegram", `${label} ${theme.fg("success", "connected")}`);
+		ctx.ui.setStatus(
+			"telegram",
+			`${label} ${theme.fg("success", "connected")}`,
+		);
+	}
+
+	function getBotToken(): string | undefined {
+		const envToken = process.env[ENV_BOT_TOKEN]?.trim();
+		return envToken || config.botToken;
+	}
+
+	function ensurePairingCode(): string {
+		if (!pairingCode) {
+			pairingCode = String(Math.floor(100000 + Math.random() * 900000));
+		}
+		return pairingCode;
+	}
+
+	function clearPairingCode(): void {
+		pairingCode = undefined;
+	}
+
+	function notifyPairingCode(ctx: ExtensionContext): void {
+		if (config.allowedUserId !== undefined || !getBotToken()) return;
+		ctx.ui.notify(
+			`Telegram pairing required. Send /pair ${ensurePairingCode()} to your bot from the Telegram account you want to allow.`,
+			"info",
+		);
 	}
 
 	async function callTelegram<TResponse>(
@@ -336,14 +402,18 @@ export default function (pi: ExtensionAPI) {
 		body: Record<string, unknown>,
 		options?: { signal?: AbortSignal },
 	): Promise<TResponse> {
-		if (!config.botToken) throw new Error("Telegram bot token is not configured");
-		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
-			const data = (await response.json()) as TelegramApiResponse<TResponse>;
+		const botToken = getBotToken();
+		if (!botToken) throw new Error("Telegram bot token is not configured");
+		const response = await fetch(
+			`https://api.telegram.org/bot${botToken}/${method}`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+				signal: options?.signal,
+			},
+		);
+		const data = (await response.json()) as TelegramApiResponse<TResponse>;
 		if (!data.ok || data.result === undefined) {
 			throw new Error(data.description || `Telegram API ${method} failed`);
 		}
@@ -358,18 +428,22 @@ export default function (pi: ExtensionAPI) {
 		fileName: string,
 		options?: { signal?: AbortSignal },
 	): Promise<TResponse> {
-		if (!config.botToken) throw new Error("Telegram bot token is not configured");
+		const botToken = getBotToken();
+		if (!botToken) throw new Error("Telegram bot token is not configured");
 		const form = new FormData();
 		for (const [key, value] of Object.entries(fields)) {
 			form.set(key, value);
 		}
 		const buffer = await readFile(filePath);
 		form.set(fileField, new Blob([buffer]), fileName);
-		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
-			method: "POST",
-			body: form,
-			signal: options?.signal,
-		});
+		const response = await fetch(
+			`https://api.telegram.org/bot${botToken}/${method}`,
+			{
+				method: "POST",
+				body: form,
+				signal: options?.signal,
+			},
+		);
 		const data = (await response.json()) as TelegramApiResponse<TResponse>;
 		if (!data.ok || data.result === undefined) {
 			throw new Error(data.description || `Telegram API ${method} failed`);
@@ -377,13 +451,25 @@ export default function (pi: ExtensionAPI) {
 		return data.result;
 	}
 
-	async function downloadTelegramFile(fileId: string, suggestedName: string): Promise<string> {
-		if (!config.botToken) throw new Error("Telegram bot token is not configured");
-		const file = await callTelegram<TelegramGetFileResult>("getFile", { file_id: fileId });
+	async function downloadTelegramFile(
+		fileId: string,
+		suggestedName: string,
+	): Promise<string> {
+		const botToken = getBotToken();
+		if (!botToken) throw new Error("Telegram bot token is not configured");
+		const file = await callTelegram<TelegramGetFileResult>("getFile", {
+			file_id: fileId,
+		});
 		await mkdir(TEMP_DIR, { recursive: true });
-		const targetPath = join(TEMP_DIR, `${Date.now()}-${sanitizeFileName(suggestedName)}`);
-		const response = await fetch(`https://api.telegram.org/file/bot${config.botToken}/${file.file_path}`);
-		if (!response.ok) throw new Error(`Failed to download Telegram file: ${response.status}`);
+		const targetPath = join(
+			TEMP_DIR,
+			`${Date.now()}-${sanitizeFileName(suggestedName)}`,
+		);
+		const response = await fetch(
+			`https://api.telegram.org/file/bot${botToken}/${file.file_path}`,
+		);
+		if (!response.ok)
+			throw new Error(`Failed to download Telegram file: ${response.status}`);
 		const arrayBuffer = await response.arrayBuffer();
 		await writeFile(targetPath, Buffer.from(arrayBuffer));
 		return targetPath;
@@ -395,7 +481,10 @@ export default function (pi: ExtensionAPI) {
 
 		const sendTyping = async (): Promise<void> => {
 			try {
-				await callTelegram("sendChatAction", { chat_id: targetChatId, action: "typing" });
+				await callTelegram("sendChatAction", {
+					chat_id: targetChatId,
+					action: "typing",
+				});
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				updateStatus(ctx, `typing failed: ${message}`);
@@ -422,8 +511,13 @@ export default function (pi: ExtensionAPI) {
 		const value = message as unknown as Record<string, unknown>;
 		const content = Array.isArray(value.content) ? value.content : [];
 		return content
-			.filter((block): block is { type: string; text?: string } => typeof block === "object" && block !== null && "type" in block)
-			.filter((block) => block.type === "text" && typeof block.text === "string")
+			.filter(
+				(block): block is { type: string; text?: string } =>
+					typeof block === "object" && block !== null && "type" in block,
+			)
+			.filter(
+				(block) => block.type === "text" && typeof block.text === "string",
+			)
 			.map((block) => block.text as string)
 			.join("")
 			.trim();
@@ -439,7 +533,11 @@ export default function (pi: ExtensionAPI) {
 		previewState = undefined;
 		if (state.mode === "draft" && state.draftId !== undefined) {
 			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: state.draftId, text: "" });
+				await callTelegram("sendMessageDraft", {
+					chat_id: chatId,
+					draft_id: state.draftId,
+					text: "",
+				});
 			} catch {
 				// ignore
 			}
@@ -452,13 +550,20 @@ export default function (pi: ExtensionAPI) {
 		state.flushTimer = undefined;
 		const text = state.pendingText.trim();
 		if (!text || text === state.lastSentText) return;
-		const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
+		const truncated =
+			text.length > MAX_MESSAGE_LENGTH
+				? text.slice(0, MAX_MESSAGE_LENGTH)
+				: text;
 
 		if (draftSupport !== "unsupported") {
 			const draftId = state.draftId ?? allocateDraftId();
 			state.draftId = draftId;
 			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
+				await callTelegram("sendMessageDraft", {
+					chat_id: chatId,
+					draft_id: draftId,
+					text: truncated,
+				});
 				draftSupport = "supported";
 				state.mode = "draft";
 				state.lastSentText = truncated;
@@ -469,13 +574,20 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (state.messageId === undefined) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
+			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+				chat_id: chatId,
+				text: truncated,
+			});
 			state.messageId = sent.message_id;
 			state.mode = "message";
 			state.lastSentText = truncated;
 			return;
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		await callTelegram("editMessageText", {
+			chat_id: chatId,
+			message_id: state.messageId,
+			text: truncated,
+		});
 		state.mode = "message";
 		state.lastSentText = truncated;
 	}
@@ -497,7 +609,10 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+			await callTelegram<TelegramSentMessage>("sendMessage", {
+				chat_id: chatId,
+				text: finalText,
+			});
 			await clearPreview(chatId);
 			return true;
 		}
@@ -505,7 +620,11 @@ export default function (pi: ExtensionAPI) {
 		return state.messageId !== undefined;
 	}
 
-	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
+	async function sendTextReply(
+		chatId: number,
+		_replyToMessageId: number,
+		text: string,
+	): Promise<number | undefined> {
 		const chunks = chunkParagraphs(text);
 		let lastMessageId: number | undefined;
 		for (const chunk of chunks) {
@@ -518,7 +637,9 @@ export default function (pi: ExtensionAPI) {
 		return lastMessageId;
 	}
 
-	async function sendQueuedAttachments(turn: ActiveTelegramTurn): Promise<void> {
+	async function sendQueuedAttachments(
+		turn: ActiveTelegramTurn,
+	): Promise<void> {
 		for (const attachment of turn.queuedAttachments) {
 			try {
 				const mediaType = guessMediaType(attachment.path);
@@ -535,21 +656,38 @@ export default function (pi: ExtensionAPI) {
 				);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				await sendTextReply(turn.chatId, turn.replyToMessageId, `Failed to send attachment ${attachment.fileName}: ${message}`);
+				await sendTextReply(
+					turn.chatId,
+					turn.replyToMessageId,
+					`Failed to send attachment ${attachment.fileName}: ${message}`,
+				);
 			}
 		}
 	}
 
-	function extractAssistantText(messages: AgentMessage[]): { text?: string; stopReason?: string; errorMessage?: string } {
+	function extractAssistantText(messages: AgentMessage[]): {
+		text?: string;
+		stopReason?: string;
+		errorMessage?: string;
+	} {
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const message = messages[i] as unknown as Record<string, unknown>;
 			if (message.role !== "assistant") continue;
-			const stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
-			const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
+			const stopReason =
+				typeof message.stopReason === "string" ? message.stopReason : undefined;
+			const errorMessage =
+				typeof message.errorMessage === "string"
+					? message.errorMessage
+					: undefined;
 			const content = Array.isArray(message.content) ? message.content : [];
 			const text = content
-				.filter((block): block is { type: string; text?: string } => typeof block === "object" && block !== null && "type" in block)
-				.filter((block) => block.type === "text" && typeof block.text === "string")
+				.filter(
+					(block): block is { type: string; text?: string } =>
+						typeof block === "object" && block !== null && "type" in block,
+				)
+				.filter(
+					(block) => block.type === "text" && typeof block.text === "string",
+				)
 				.map((block) => block.text as string)
 				.join("")
 				.trim();
@@ -558,11 +696,15 @@ export default function (pi: ExtensionAPI) {
 		return {};
 	}
 
-	function collectTelegramFileInfos(messages: TelegramMessage[]): TelegramFileInfo[] {
+	function collectTelegramFileInfos(
+		messages: TelegramMessage[],
+	): TelegramFileInfo[] {
 		const files: TelegramFileInfo[] = [];
 		for (const message of messages) {
 			if (Array.isArray(message.photo) && message.photo.length > 0) {
-				const photo = [...message.photo].sort((a, b) => (a.file_size ?? 0) - (b.file_size ?? 0)).pop();
+				const photo = [...message.photo]
+					.sort((a, b) => (a.file_size ?? 0) - (b.file_size ?? 0))
+					.pop();
 				if (photo) {
 					files.push({
 						file_id: photo.file_id,
@@ -573,7 +715,9 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 			if (message.document) {
-				const fileName = message.document.file_name || `document-${message.message_id}${guessExtensionFromMime(message.document.mime_type, "")}`;
+				const fileName =
+					message.document.file_name ||
+					`document-${message.message_id}${guessExtensionFromMime(message.document.mime_type, "")}`;
 				files.push({
 					file_id: message.document.file_id,
 					fileName,
@@ -582,7 +726,9 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			if (message.video) {
-				const fileName = message.video.file_name || `video-${message.message_id}${guessExtensionFromMime(message.video.mime_type, ".mp4")}`;
+				const fileName =
+					message.video.file_name ||
+					`video-${message.message_id}${guessExtensionFromMime(message.video.mime_type, ".mp4")}`;
 				files.push({
 					file_id: message.video.file_id,
 					fileName,
@@ -591,7 +737,9 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			if (message.audio) {
-				const fileName = message.audio.file_name || `audio-${message.message_id}${guessExtensionFromMime(message.audio.mime_type, ".mp3")}`;
+				const fileName =
+					message.audio.file_name ||
+					`audio-${message.message_id}${guessExtensionFromMime(message.audio.mime_type, ".mp3")}`;
 				files.push({
 					file_id: message.audio.file_id,
 					fileName,
@@ -608,7 +756,9 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			if (message.animation) {
-				const fileName = message.animation.file_name || `animation-${message.message_id}${guessExtensionFromMime(message.animation.mime_type, ".mp4")}`;
+				const fileName =
+					message.animation.file_name ||
+					`animation-${message.message_id}${guessExtensionFromMime(message.animation.mime_type, ".mp4")}`;
 				files.push({
 					file_id: message.animation.file_id,
 					fileName,
@@ -628,41 +778,123 @@ export default function (pi: ExtensionAPI) {
 		return files;
 	}
 
-	async function buildTelegramFiles(messages: TelegramMessage[]): Promise<DownloadedTelegramFile[]> {
+	async function buildTelegramFiles(
+		messages: TelegramMessage[],
+	): Promise<DownloadedTelegramFile[]> {
 		const downloaded: DownloadedTelegramFile[] = [];
 		for (const file of collectTelegramFileInfos(messages)) {
 			const path = await downloadTelegramFile(file.file_id, file.fileName);
-			downloaded.push({ path, fileName: file.fileName, isImage: file.isImage, mimeType: file.mimeType });
+			downloaded.push({
+				path,
+				fileName: file.fileName,
+				isImage: file.isImage,
+				mimeType: file.mimeType,
+			});
 		}
 		return downloaded;
+	}
+
+	async function configureBotToken(
+		token: string,
+		persistToken: boolean,
+	): Promise<TelegramConfig> {
+		const response = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+		const data = (await response.json()) as TelegramApiResponse<TelegramUser>;
+		if (!data.ok || !data.result) {
+			throw new Error(data.description || "Invalid Telegram bot token");
+		}
+
+		return {
+			...config,
+			botToken: persistToken ? token : config.botToken,
+			botId: data.result.id,
+			botUsername: data.result.username,
+		};
 	}
 
 	async function promptForConfig(ctx: ExtensionContext): Promise<void> {
 		if (!ctx.hasUI || setupInProgress) return;
 		setupInProgress = true;
 		try {
-			const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
+			const envToken = process.env[ENV_BOT_TOKEN]?.trim();
+			const token =
+				envToken ||
+				(await ctx.ui.input("Telegram bot token", "123456:ABCDEF..."))?.trim();
 			if (!token) return;
 
-			const nextConfig: TelegramConfig = { ...config, botToken: token.trim() };
-			const response = await fetch(`https://api.telegram.org/bot${nextConfig.botToken}/getMe`);
-			const data = (await response.json()) as TelegramApiResponse<TelegramUser>;
-			if (!data.ok || !data.result) {
-				ctx.ui.notify(data.description || "Invalid Telegram bot token", "error");
+			try {
+				config = await configureBotToken(token, !envToken);
+				await writeConfig(config);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(message, "error");
 				return;
 			}
 
-			nextConfig.botId = data.result.id;
-			nextConfig.botUsername = data.result.username;
-			config = nextConfig;
-			await writeConfig(config);
-			ctx.ui.notify(`Telegram bot connected: @${config.botUsername ?? "unknown"}`, "info");
-			ctx.ui.notify("Send /start to your bot in Telegram to pair this extension with your account.", "info");
+			ctx.ui.notify(
+				`Telegram bot connected: @${config.botUsername ?? "unknown"}${envToken ? ` (token from ${ENV_BOT_TOKEN})` : ""}`,
+				"info",
+			);
+			notifyPairingCode(ctx);
 			await startPolling(ctx);
 			updateStatus(ctx);
 		} finally {
 			setupInProgress = false;
 		}
+	}
+
+	function isProcessRunning(pid: number): boolean {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "EPERM";
+		}
+	}
+
+	async function acquirePollingLock(ctx: ExtensionContext): Promise<boolean> {
+		if (hasPollingLock) return true;
+		await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
+		try {
+			const handle = await open(LOCK_PATH, "wx");
+			await handle.writeFile(
+				JSON.stringify({
+					pid: process.pid,
+					startedAt: new Date().toISOString(),
+				}) + "\n",
+				"utf8",
+			);
+			await handle.close();
+			hasPollingLock = true;
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+
+		try {
+			const lock = JSON.parse(await readFile(LOCK_PATH, "utf8")) as {
+				pid?: number;
+				startedAt?: string;
+			};
+			if (typeof lock.pid === "number" && isProcessRunning(lock.pid)) {
+				ctx.ui.notify(
+					`Telegram bridge is already polling in another pi process (pid ${lock.pid}${lock.startedAt ? `, started ${lock.startedAt}` : ""}). Run /telegram-disconnect there or remove ${LOCK_PATH} if stale.`,
+					"warning",
+				);
+				return false;
+			}
+		} catch {
+			// Malformed lock files are treated as stale.
+		}
+
+		await unlink(LOCK_PATH).catch(() => undefined);
+		return acquirePollingLock(ctx);
+	}
+
+	async function releasePollingLock(): Promise<void> {
+		if (!hasPollingLock) return;
+		hasPollingLock = false;
+		await unlink(LOCK_PATH).catch(() => undefined);
 	}
 
 	async function stopPolling(): Promise<void> {
@@ -671,9 +903,13 @@ export default function (pi: ExtensionAPI) {
 		pollingController = undefined;
 		await pollingPromise?.catch(() => undefined);
 		pollingPromise = undefined;
+		await releasePollingLock();
 	}
 
-	function formatTelegramHistoryText(rawText: string, files: DownloadedTelegramFile[]): string {
+	function formatTelegramHistoryText(
+		rawText: string,
+		files: DownloadedTelegramFile[],
+	): string {
 		let summary = rawText.length > 0 ? rawText : "(no text)";
 		if (files.length > 0) {
 			summary += `\nAttachments:`;
@@ -689,8 +925,12 @@ export default function (pi: ExtensionAPI) {
 		historyTurns: PendingTelegramTurn[] = [],
 	): Promise<PendingTelegramTurn> {
 		const firstMessage = messages[0];
-		if (!firstMessage) throw new Error("Missing Telegram message for turn creation");
-		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).filter(Boolean).join("\n\n");
+		if (!firstMessage)
+			throw new Error("Missing Telegram message for turn creation");
+		const rawText = messages
+			.map((message) => (message.text || message.caption || "").trim())
+			.filter(Boolean)
+			.join("\n\n");
 		const files = await buildTelegramFiles(messages);
 		const content: Array<TextContent | ImageContent> = [];
 		let prompt = `${TELEGRAM_PREFIX}`;
@@ -735,10 +975,16 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], ctx: ExtensionContext): Promise<void> {
+	async function dispatchAuthorizedTelegramMessages(
+		messages: TelegramMessage[],
+		ctx: ExtensionContext,
+	): Promise<void> {
 		const firstMessage = messages[0];
 		if (!firstMessage) return;
-		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).find((text) => text.length > 0) || "";
+		const rawText =
+			messages
+				.map((message) => (message.text || message.caption || "").trim())
+				.find((text) => text.length > 0) || "";
 		const lower = rawText.toLowerCase();
 
 		if (lower === "stop" || lower === "/stop") {
@@ -748,28 +994,53 @@ export default function (pi: ExtensionAPI) {
 				}
 				currentAbort();
 				updateStatus(ctx);
-				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Aborted current turn.");
+				await sendTextReply(
+					firstMessage.chat.id,
+					firstMessage.message_id,
+					"Aborted current turn.",
+				);
 			} else {
-				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "No active turn.");
+				await sendTextReply(
+					firstMessage.chat.id,
+					firstMessage.message_id,
+					"No active turn.",
+				);
 			}
 			return;
 		}
 
 		if (lower === "/compact") {
 			if (!ctx.isIdle()) {
-				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot compact while pi is busy. Send \"stop\" first.");
+				await sendTextReply(
+					firstMessage.chat.id,
+					firstMessage.message_id,
+					'Cannot compact while pi is busy. Send "stop" first.',
+				);
 				return;
 			}
 			ctx.compact({
 				onComplete: () => {
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.");
+					void sendTextReply(
+						firstMessage.chat.id,
+						firstMessage.message_id,
+						"Compaction completed.",
+					);
 				},
 				onError: (error) => {
-					const message = error instanceof Error ? error.message : String(error);
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`);
+					const message =
+						error instanceof Error ? error.message : String(error);
+					void sendTextReply(
+						firstMessage.chat.id,
+						firstMessage.message_id,
+						`Compaction failed: ${message}`,
+					);
 				},
 			});
-			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
+			await sendTextReply(
+				firstMessage.chat.id,
+				firstMessage.message_id,
+				"Compaction started.",
+			);
 			return;
 		}
 
@@ -781,7 +1052,8 @@ export default function (pi: ExtensionAPI) {
 			let totalCost = 0;
 
 			for (const entry of ctx.sessionManager.getEntries()) {
-				if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+				if (entry.type !== "message" || entry.message.role !== "assistant")
+					continue;
 				totalInput += entry.message.usage.input;
 				totalOutput += entry.message.usage.output;
 				totalCacheRead += entry.message.usage.cacheRead;
@@ -802,13 +1074,19 @@ export default function (pi: ExtensionAPI) {
 			if (tokenParts.length > 0) {
 				lines.push(`Usage: ${tokenParts.join(" ")}`);
 			}
-			const usingSubscription = ctx.model ? ctx.modelRegistry.isUsingOAuth(ctx.model) : false;
+			const usingSubscription = ctx.model
+				? ctx.modelRegistry.isUsingOAuth(ctx.model)
+				: false;
 			if (totalCost || usingSubscription) {
-				lines.push(`Cost: $${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`);
+				lines.push(
+					`Cost: $${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`,
+				);
 			}
 			if (usage) {
-				const contextWindow = usage.contextWindow ?? ctx.model?.contextWindow ?? 0;
-				const percent = usage.percent !== null ? `${usage.percent.toFixed(1)}%` : "?";
+				const contextWindow =
+					usage.contextWindow ?? ctx.model?.contextWindow ?? 0;
+				const percent =
+					usage.percent !== null ? `${usage.percent.toFixed(1)}%` : "?";
 				lines.push(`Context: ${percent}/${formatTokens(contextWindow)}`);
 			} else {
 				lines.push("Context: unknown");
@@ -816,7 +1094,11 @@ export default function (pi: ExtensionAPI) {
 			if (lines.length === 0) {
 				lines.push("No usage data yet.");
 			}
-			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, lines.join("\n"));
+			await sendTextReply(
+				firstMessage.chat.id,
+				firstMessage.message_id,
+				lines.join("\n"),
+			);
 			return;
 		}
 
@@ -824,17 +1106,14 @@ export default function (pi: ExtensionAPI) {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
+				`Send me a message and I will forward it to pi. Commands: /status, /compact, /stop. Pairing is managed from pi with /telegram-reset-pairing.`,
 			);
-			if (config.allowedUserId === undefined && firstMessage.from) {
-				config.allowedUserId = firstMessage.from.id;
-				await writeConfig(config);
-				updateStatus(ctx);
-			}
 			return;
 		}
 
-		const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
+		const historyTurns = preserveQueuedTurnsAsHistory
+			? queuedTelegramTurns.splice(0)
+			: [];
 		preserveQueuedTurnsAsHistory = false;
 		const turn = await createTelegramTurn(messages, historyTurns);
 		queuedTelegramTurns.push(turn);
@@ -845,7 +1124,10 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
+	async function handleAuthorizedTelegramMessage(
+		message: TelegramMessage,
+		ctx: ExtensionContext,
+	): Promise<void> {
 		if (message.media_group_id) {
 			const key = `${message.chat.id}:${message.media_group_id}`;
 			const existing = mediaGroups.get(key) ?? { messages: [] };
@@ -864,37 +1146,79 @@ export default function (pi: ExtensionAPI) {
 		await dispatchAuthorizedTelegramMessages([message], ctx);
 	}
 
-	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext): Promise<void> {
+	async function handleUpdate(
+		update: TelegramUpdate,
+		ctx: ExtensionContext,
+	): Promise<void> {
 		const message = update.message || update.edited_message;
-		if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
+		if (
+			!message ||
+			message.chat.type !== "private" ||
+			!message.from ||
+			message.from.is_bot
+		)
+			return;
 
 		if (config.allowedUserId === undefined) {
-			config.allowedUserId = message.from.id;
-			await writeConfig(config);
-			updateStatus(ctx);
-			await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
+			const text = (message.text || "").trim();
+			const expectedPairCommand = `/pair ${ensurePairingCode()}`;
+			if (text === expectedPairCommand) {
+				config.allowedUserId = message.from.id;
+				clearPairingCode();
+				await writeConfig(config);
+				updateStatus(ctx);
+				await sendTextReply(
+					message.chat.id,
+					message.message_id,
+					"Telegram bridge paired with this account.",
+				);
+				return;
+			}
+
+			await sendTextReply(
+				message.chat.id,
+				message.message_id,
+				`This bot is not paired yet. In pi, check the telegram status and send the shown command, e.g. /pair 123456.`,
+			);
+			notifyPairingCode(ctx);
+			return;
 		}
 
 		if (message.from.id !== config.allowedUserId) {
-			await sendTextReply(message.chat.id, message.message_id, "This bot is not authorized for your account.");
+			await sendTextReply(
+				message.chat.id,
+				message.message_id,
+				"This bot is not authorized for your account.",
+			);
 			return;
 		}
 
 		await handleAuthorizedTelegramMessage(message, ctx);
 	}
 
-	async function pollLoop(ctx: ExtensionContext, signal: AbortSignal): Promise<void> {
-		if (!config.botToken) return;
+	async function pollLoop(
+		ctx: ExtensionContext,
+		signal: AbortSignal,
+	): Promise<void> {
+		if (!getBotToken()) return;
 
 		try {
-			await callTelegram("deleteWebhook", { drop_pending_updates: false }, { signal });
+			await callTelegram(
+				"deleteWebhook",
+				{ drop_pending_updates: false },
+				{ signal },
+			);
 		} catch {
 			// ignore
 		}
 
 		if (config.lastUpdateId === undefined) {
 			try {
-				const updates = await callTelegram<TelegramUpdate[]>("getUpdates", { offset: -1, limit: 1, timeout: 0 }, { signal });
+				const updates = await callTelegram<TelegramUpdate[]>(
+					"getUpdates",
+					{ offset: -1, limit: 1, timeout: 0 },
+					{ signal },
+				);
 				const last = updates.at(-1);
 				if (last) {
 					config.lastUpdateId = last.update_id;
@@ -910,7 +1234,10 @@ export default function (pi: ExtensionAPI) {
 				const updates = await callTelegram<TelegramUpdate[]>(
 					"getUpdates",
 					{
-						offset: config.lastUpdateId !== undefined ? config.lastUpdateId + 1 : undefined,
+						offset:
+							config.lastUpdateId !== undefined
+								? config.lastUpdateId + 1
+								: undefined,
 						limit: 10,
 						timeout: 30,
 						allowed_updates: ["message", "edited_message"],
@@ -924,7 +1251,8 @@ export default function (pi: ExtensionAPI) {
 				}
 			} catch (error) {
 				if (signal.aborted) return;
-				if (error instanceof DOMException && error.name === "AbortError") return;
+				if (error instanceof DOMException && error.name === "AbortError")
+					return;
 				const message = error instanceof Error ? error.message : String(error);
 				updateStatus(ctx, message);
 				await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -934,30 +1262,44 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function startPolling(ctx: ExtensionContext): Promise<void> {
-		if (!config.botToken || pollingPromise) return;
+		if (!getBotToken() || pollingPromise) return;
+		if (!(await acquirePollingLock(ctx))) {
+			updateStatus(ctx, "another pi session is already polling");
+			return;
+		}
 		pollingController = new AbortController();
-		pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
-			pollingPromise = undefined;
-			pollingController = undefined;
-			updateStatus(ctx);
-		});
+		pollingPromise = pollLoop(ctx, pollingController.signal).finally(
+			async () => {
+				pollingPromise = undefined;
+				pollingController = undefined;
+				await releasePollingLock();
+				updateStatus(ctx);
+			},
+		);
+		notifyPairingCode(ctx);
 		updateStatus(ctx);
 	}
 
 	pi.registerTool({
 		name: "telegram_attach",
 		label: "Telegram Attach",
-		description: "Queue one or more local files to be sent with the next Telegram reply.",
+		description:
+			"Queue one or more local files to be sent with the next Telegram reply.",
 		promptSnippet: "Queue local files to be sent with the next Telegram reply.",
 		promptGuidelines: [
 			"When handling a [telegram] message and the user asked for a file or generated artifact, call telegram_attach with the local path instead of only mentioning the path in text.",
 		],
 		parameters: Type.Object({
-			paths: Type.Array(Type.String({ description: "Local file path to attach" }), { minItems: 1, maxItems: MAX_ATTACHMENTS_PER_TURN }),
+			paths: Type.Array(
+				Type.String({ description: "Local file path to attach" }),
+				{ minItems: 1, maxItems: MAX_ATTACHMENTS_PER_TURN },
+			),
 		}),
 		async execute(_toolCallId, params) {
 			if (!activeTelegramTurn) {
-				throw new Error("telegram_attach can only be used while replying to an active Telegram turn");
+				throw new Error(
+					"telegram_attach can only be used while replying to an active Telegram turn",
+				);
 			}
 			const added: string[] = [];
 			for (const inputPath of params.paths) {
@@ -965,14 +1307,27 @@ export default function (pi: ExtensionAPI) {
 				if (!stats.isFile()) {
 					throw new Error(`Not a file: ${inputPath}`);
 				}
-				if (activeTelegramTurn.queuedAttachments.length >= MAX_ATTACHMENTS_PER_TURN) {
-					throw new Error(`Attachment limit reached (${MAX_ATTACHMENTS_PER_TURN})`);
+				if (
+					activeTelegramTurn.queuedAttachments.length >=
+					MAX_ATTACHMENTS_PER_TURN
+				) {
+					throw new Error(
+						`Attachment limit reached (${MAX_ATTACHMENTS_PER_TURN})`,
+					);
 				}
-				activeTelegramTurn.queuedAttachments.push({ path: inputPath, fileName: basename(inputPath) });
+				activeTelegramTurn.queuedAttachments.push({
+					path: inputPath,
+					fileName: basename(inputPath),
+				});
 				added.push(inputPath);
 			}
 			return {
-				content: [{ type: "text", text: `Queued ${added.length} Telegram attachment(s).` }],
+				content: [
+					{
+						type: "text",
+						text: `Queued ${added.length} Telegram attachment(s).`,
+					},
+				],
 				details: { paths: added },
 			};
 		},
@@ -989,9 +1344,11 @@ export default function (pi: ExtensionAPI) {
 		description: "Show Telegram bridge status",
 		handler: async (_args, ctx) => {
 			const status = [
-				`bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
-				`allowed user: ${config.allowedUserId ?? "not paired"}`,
+				`bot: ${config.botUsername ? `@${config.botUsername}` : getBotToken() ? "configured" : "not configured"}`,
+				`token source: ${process.env[ENV_BOT_TOKEN]?.trim() ? ENV_BOT_TOKEN : config.botToken ? "config file" : "none"}`,
+				`allowed user: ${config.allowedUserId ?? `not paired; send /pair ${ensurePairingCode()}`}`,
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
+				`single-session lock: ${hasPollingLock ? LOCK_PATH : "not held"}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
 				`queued telegram turns: ${queuedTelegramTurns.length}`,
 			];
@@ -999,13 +1356,38 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("telegram-reset-pairing", {
+		description: "Forget the allowed Telegram user and show a new pairing code",
+		handler: async (_args, ctx) => {
+			config = { ...config, allowedUserId: undefined };
+			clearPairingCode();
+			await writeConfig(config);
+			notifyPairingCode(ctx);
+			updateStatus(ctx);
+		},
+	});
+
 	pi.registerCommand("telegram-connect", {
 		description: "Start the Telegram bridge in this pi session",
 		handler: async (_args, ctx) => {
 			config = await readConfig();
-			if (!config.botToken) {
+			if (!getBotToken()) {
 				await promptForConfig(ctx);
 				return;
+			}
+			if (process.env[ENV_BOT_TOKEN]?.trim() && !config.botUsername) {
+				try {
+					config = await configureBotToken(
+						process.env[ENV_BOT_TOKEN]!.trim(),
+						false,
+					);
+					await writeConfig(config);
+				} catch (error) {
+					const message =
+						error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(message, "error");
+					return;
+				}
 			}
 			await startPolling(ctx);
 			updateStatus(ctx);
@@ -1056,7 +1438,11 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
 				activeTelegramTurn = { ...nextTurn };
-				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+				previewState = {
+					mode: draftSupport === "unsupported" ? "message" : "draft",
+					pendingText: "",
+					lastSentText: "",
+				};
 				startTypingLoop(ctx);
 			}
 		}
@@ -1065,16 +1451,28 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("message_start", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
-		if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
+		if (
+			previewState &&
+			(previewState.pendingText.trim().length > 0 ||
+				previewState.lastSentText.trim().length > 0)
+		) {
 			await finalizePreview(activeTelegramTurn.chatId);
 		}
-		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+		previewState = {
+			mode: draftSupport === "unsupported" ? "message" : "draft",
+			pendingText: "",
+			lastSentText: "",
+		};
 	});
 
 	pi.on("message_update", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
 		if (!previewState) {
-			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			previewState = {
+				mode: draftSupport === "unsupported" ? "message" : "draft",
+				pendingText: "",
+				lastSentText: "",
+			};
 		}
 		previewState.pendingText = getMessageText(event.message);
 		schedulePreviewFlush(activeTelegramTurn.chatId);
@@ -1095,7 +1493,12 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (assistant.stopReason === "error") {
 			await clearPreview(turn.chatId);
-			await sendTextReply(turn.chatId, turn.replyToMessageId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.");
+			await sendTextReply(
+				turn.chatId,
+				turn.replyToMessageId,
+				assistant.errorMessage ||
+					"Telegram bridge: pi failed while processing the request.",
+			);
 			return;
 		}
 
@@ -1107,14 +1510,22 @@ export default function (pi: ExtensionAPI) {
 		if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
 			const finalized = await finalizePreview(turn.chatId);
 			if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+				await sendTextReply(
+					turn.chatId,
+					turn.replyToMessageId,
+					"Attached requested file(s).",
+				);
 			}
 		} else {
 			await clearPreview(turn.chatId);
 			if (finalText) {
 				await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
 			} else if (turn.queuedAttachments.length > 0) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+				await sendTextReply(
+					turn.chatId,
+					turn.replyToMessageId,
+					"Attached requested file(s).",
+				);
 			}
 		}
 

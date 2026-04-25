@@ -1,26 +1,36 @@
 {
-  "name": "pi-telegram",
-  "version": "0.1.0",
-  "private": false,
-  "description": "Telegram DM bridge extension for pi",
-  "type": "module",
-  "keywords": ["pi-package", "pi", "telegram", "bot", "extension"],
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/badlogic/pi-telegram.git"
-  },
-  "homepage": "https://github.com/badlogic/pi-telegram",
-  "bugs": {
-    "url": "https://github.com/badlogic/pi-telegram/issues"
-  },
-  "pi": {
-    "extensions": ["./index.ts"]
-  },
-  "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
-  }
+	"name": "pi-telegram",
+	"version": "0.2.0",
+	"private": false,
+	"description": "Pi Extension Architect Telegram bridge for pi",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"telegram",
+		"bot",
+		"extension",
+		"bridge"
+	],
+	"license": "MIT",
+	"author": "followdeKlerk",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/followdeKlerk/pi-telegram.git"
+	},
+	"homepage": "https://github.com/followdeKlerk/pi-telegram#readme",
+	"bugs": {
+		"url": "https://github.com/followdeKlerk/pi-telegram/issues"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@mariozechner/pi-ai": "*",
+		"@mariozechner/pi-agent-core": "*",
+		"@mariozechner/pi-coding-agent": "*",
+		"@sinclair/typebox": "*"
+	}
 }
