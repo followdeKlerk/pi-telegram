@@ -936,6 +936,7 @@ export default function (pi: ExtensionAPI) {
 
 	function getMessageText(message: AgentMessage): string {
 		const value = message as unknown as Record<string, unknown>;
+		if (typeof value.content === "string") return value.content.trim();
 		const content = Array.isArray(value.content) ? value.content : [];
 		return content
 			.filter(
@@ -1271,30 +1272,46 @@ export default function (pi: ExtensionAPI) {
 		stopReason?: string;
 		errorMessage?: string;
 	} {
+		let foundText: string | undefined;
+		let stopReason: string | undefined;
+		let errorMessage: string | undefined;
+
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const message = messages[i] as unknown as Record<string, unknown>;
 			if (message.role !== "assistant") continue;
-			const stopReason =
-				typeof message.stopReason === "string" ? message.stopReason : undefined;
-			const errorMessage =
-				typeof message.errorMessage === "string"
-					? message.errorMessage
-					: undefined;
-			const content = Array.isArray(message.content) ? message.content : [];
-			const text = content
-				.filter(
-					(block): block is { type: string; text?: string } =>
-						typeof block === "object" && block !== null && "type" in block,
-				)
-				.filter(
-					(block) => block.type === "text" && typeof block.text === "string",
-				)
-				.map((block) => block.text as string)
-				.join("")
-				.trim();
-			return { text: text || undefined, stopReason, errorMessage };
+			
+			if (stopReason === undefined) {
+				stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
+			}
+			if (errorMessage === undefined) {
+				errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
+			}
+
+			let text = "";
+			if (typeof message.content === "string") {
+				text = message.content.trim();
+			} else {
+				const content = Array.isArray(message.content) ? message.content : [];
+				text = content
+					.filter(
+						(block): block is { type: string; text?: string } =>
+							typeof block === "object" && block !== null && "type" in block,
+					)
+					.filter(
+						(block) => block.type === "text" && typeof block.text === "string",
+					)
+					.map((block) => block.text as string)
+					.join("")
+					.trim();
+			}
+
+			if (text) {
+				foundText = text;
+				break;
+			}
+			// If we found the last assistant message but it had no text, we continue backwards to find the last text it produced.
 		}
-		return {};
+		return { text: foundText, stopReason, errorMessage };
 	}
 
 	function collectTelegramFileInfos(

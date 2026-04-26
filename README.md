@@ -260,6 +260,7 @@ Token/context/tool visibility depends on what pi exposes at runtime. If a value 
 - Replies are sent as normal Telegram messages, not quote-replies
 - Long replies are split below Telegram's 4096 character limit
 - Outbound files are sent via `telegram_attach`
+- Fixed an issue where final text replies were sometimes dropped if the agent used a tool at the end of its turn or responded with unformatted text.
 
 ## License
 
