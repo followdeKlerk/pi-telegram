@@ -76,6 +76,8 @@ Check status, including the pairing command and lock state:
 /telegram-status
 ```
 
+The bridge auto-reconnects on session start when a bot token is configured, and refreshes the Telegram bot command menu with the supported Telegram commands.
+
 ## Pair your Telegram account
 
 Pairing is not automatic. After token setup and `/telegram-connect`, pi shows a one-time command such as:
@@ -123,6 +125,30 @@ Examples:
 - `write me a markdown file with the plan and send it back`
 - `generate a shell script and attach it`
 
+### Telegram commands
+
+The bridge handles these commands directly from Telegram:
+
+```text
+/status
+/new
+/compact
+/stop
+/reload
+/telegram_verbose on|off|status
+/help
+```
+
+`/new` starts a real replacement pi session, and `/reload` reloads pi resources/extensions.
+
+Pi prompt templates and skills are expanded and sent to pi from Telegram, for example:
+
+```text
+/skill:pi-subagents review this approach
+```
+
+Interactive-only TUI commands such as `/model`, `/resume`, `/tree`, and `/fork` are rejected from Telegram instead of being silently forwarded to the model.
+
 ### Stop a run
 
 In Telegram, send:
@@ -159,6 +185,7 @@ Enable it from pi or from the paired Telegram DM:
 /telegram-verbose on
 /telegram-verbose off
 /telegram-verbose status
+/telegram_verbose status
 ```
 
 Verbose settings are persisted in:

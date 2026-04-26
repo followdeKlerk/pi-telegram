@@ -38,6 +38,9 @@ interface TelegramApiResponse<T> {
 	result?: T;
 	description?: string;
 	error_code?: number;
+	parameters?: {
+		retry_after?: number;
+	};
 }
 
 interface TelegramUser {
@@ -169,6 +172,12 @@ interface TelegramMediaGroupState {
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
+interface TelegramCommandRequest {
+	chatId: number;
+	replyToMessageId: number;
+	command: string;
+}
+
 type TelegramTelemetryStatus =
 	| "queued"
 	| "running"
@@ -212,10 +221,10 @@ const ENV_BOT_TOKEN = "PI_TELEGRAM_BOT_TOKEN";
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
-const PREVIEW_THROTTLE_MS = 750;
+const PREVIEW_THROTTLE_MS = 5000;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
-const DEFAULT_TELEMETRY_INTERVAL_MS = 1000;
+const DEFAULT_TELEMETRY_INTERVAL_MS = 5000;
 const MAX_TELEMETRY_OUTPUT_LINES = 8;
 const MAX_TELEMETRY_TOOL_HISTORY = 3;
 const MAX_TELEMETRY_TREE_COMMAND_LENGTH = 120;
@@ -495,14 +504,16 @@ export default function (pi: ExtensionAPI) {
 	let pairingCode: string | undefined;
 	let hasPollingLock = false;
 	let telemetryState: TelegramTelemetryState | undefined;
+	let telegramRateLimitedUntil = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
+	const telegramCommandRequests = new Map<string, TelegramCommandRequest>();
 
 	function isVerboseTelemetryEnabled(): boolean {
 		return config.verbose === true;
 	}
 
 	function shouldStreamAssistantText(): boolean {
-		return config.streamAssistantText !== false;
+		return config.streamAssistantText === true;
 	}
 
 	function shouldStreamTelemetry(): boolean {
@@ -562,7 +573,7 @@ export default function (pi: ExtensionAPI) {
 		const parts = rawText.trim().toLowerCase().split(/\s+/).filter(Boolean);
 		const command = parts[0] ?? "";
 		const commandName = command.split("@")[0];
-		if (commandName !== "/telegram-verbose") return "unknown";
+		if (commandName !== "/telegram-verbose" && commandName !== "/telegram_verbose") return "unknown";
 		const action = parts[1] ?? "status";
 		if (["on", "enable", "enabled", "true", "1"].includes(action)) return "on";
 		if (["off", "disable", "disabled", "false", "0"].includes(action))
@@ -575,7 +586,10 @@ export default function (pi: ExtensionAPI) {
 		config = {
 			...config,
 			verbose: enabled,
-			streamAssistantText: true,
+			// Assistant text streaming edits Telegram messages repeatedly and can hit
+			// Telegram flood limits. Keep it off even in verbose mode unless the user
+			// explicitly enables streamAssistantText in telegram.json.
+			streamAssistantText: false,
 			streamTelemetry: enabled,
 			streamToolCalls: enabled,
 			streamBash: enabled,
@@ -783,6 +797,22 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
+	function createTelegramRateLimitError(method: string, retryAfter: number): Error {
+		telegramRateLimitedUntil = Math.max(
+			telegramRateLimitedUntil,
+			Date.now() + retryAfter * 1000,
+		);
+		const error = new Error(
+			`Telegram API rate limited ${method}; retry after ${retryAfter}s`,
+		);
+		error.name = "TelegramRateLimitError";
+		return error;
+	}
+
+	function isTelegramRateLimitError(error: unknown): boolean {
+		return error instanceof Error && error.name === "TelegramRateLimitError";
+	}
+
 	async function callTelegram<TResponse>(
 		method: string,
 		body: Record<string, unknown>,
@@ -790,6 +820,13 @@ export default function (pi: ExtensionAPI) {
 	): Promise<TResponse> {
 		const botToken = getBotToken();
 		if (!botToken) throw new Error("Telegram bot token is not configured");
+		const retryAfterMs = telegramRateLimitedUntil - Date.now();
+		if (retryAfterMs > 0) {
+			throw createTelegramRateLimitError(
+				method,
+				Math.ceil(retryAfterMs / 1000),
+			);
+		}
 		const response = await fetch(
 			`https://api.telegram.org/bot${botToken}/${method}`,
 			{
@@ -801,6 +838,10 @@ export default function (pi: ExtensionAPI) {
 		);
 		const data = (await response.json()) as TelegramApiResponse<TResponse>;
 		if (!data.ok || data.result === undefined) {
+			const retryAfter = data.parameters?.retry_after;
+			if (data.error_code === 429 && typeof retryAfter === "number") {
+				throw createTelegramRateLimitError(method, retryAfter);
+			}
 			throw new Error(data.description || `Telegram API ${method} failed`);
 		}
 		return data.result;
@@ -880,7 +921,7 @@ export default function (pi: ExtensionAPI) {
 		void sendTyping();
 		typingInterval = setInterval(() => {
 			void sendTyping();
-		}, 4000);
+		}, 10000);
 	}
 
 	function stopTypingLoop(): void {
@@ -959,23 +1000,27 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		if (state.messageId === undefined) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+		try {
+			if (state.messageId === undefined) {
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+					chat_id: chatId,
+					text: truncated,
+				});
+				state.messageId = sent.message_id;
+				state.mode = "message";
+				state.lastSentText = truncated;
+				return;
+			}
+			await callTelegram("editMessageText", {
 				chat_id: chatId,
+				message_id: state.messageId,
 				text: truncated,
 			});
-			state.messageId = sent.message_id;
 			state.mode = "message";
 			state.lastSentText = truncated;
-			return;
+		} catch (error) {
+			if (!isTelegramRateLimitError(error)) throw error;
 		}
-		await callTelegram("editMessageText", {
-			chat_id: chatId,
-			message_id: state.messageId,
-			text: truncated,
-		});
-		state.mode = "message";
-		state.lastSentText = truncated;
 	}
 
 	function schedulePreviewFlush(chatId: number): void {
@@ -995,12 +1040,18 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", {
-				chat_id: chatId,
-				text: finalText,
-			});
-			await clearPreview(chatId);
-			return true;
+			try {
+				await callTelegram<TelegramSentMessage>("sendMessage", {
+					chat_id: chatId,
+					text: finalText,
+				});
+				await clearPreview(chatId);
+				return true;
+			} catch (error) {
+				if (!isTelegramRateLimitError(error)) throw error;
+				previewState = undefined;
+				return false;
+			}
 		}
 		previewState = undefined;
 		return state.messageId !== undefined;
@@ -1014,11 +1065,16 @@ export default function (pi: ExtensionAPI) {
 		const chunks = chunkParagraphs(text);
 		let lastMessageId: number | undefined;
 		for (const chunk of chunks) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-				chat_id: chatId,
-				text: chunk,
-			});
-			lastMessageId = sent.message_id;
+			try {
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+					chat_id: chatId,
+					text: chunk,
+				});
+				lastMessageId = sent.message_id;
+			} catch (error) {
+				if (!isTelegramRateLimitError(error)) throw error;
+				return lastMessageId;
+			}
 		}
 		return lastMessageId;
 	}
@@ -1048,6 +1104,124 @@ export default function (pi: ExtensionAPI) {
 					`Failed to send attachment ${attachment.fileName}: ${message}`,
 				);
 			}
+		}
+	}
+
+	function createTelegramCommandRequest(
+		message: TelegramMessage,
+		command: string,
+	): string {
+		const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		telegramCommandRequests.set(id, {
+			chatId: message.chat.id,
+			replyToMessageId: message.message_id,
+			command,
+		});
+		return id;
+	}
+
+	function takeTelegramCommandRequest(
+		id: string,
+	): TelegramCommandRequest | undefined {
+		const request = telegramCommandRequests.get(id);
+		if (request) telegramCommandRequests.delete(id);
+		return request;
+	}
+
+	function parseSlashCommandName(rawText: string): string | undefined {
+		const trimmed = rawText.trim();
+		if (!trimmed.startsWith("/")) return undefined;
+		const first = trimmed.split(/\s+/, 1)[0] ?? "";
+		const withoutBot = first.split("@")[0] ?? first;
+		return withoutBot.slice(1);
+	}
+
+	function stripFrontmatter(content: string): string {
+		return content.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
+	}
+
+	function parseCommandArgs(argsString: string): string[] {
+		const args: string[] = [];
+		let current = "";
+		let quote: string | undefined;
+		for (const char of argsString) {
+			if (quote) {
+				if (char === quote) quote = undefined;
+				else current += char;
+			} else if (char === '"' || char === "'") {
+				quote = char;
+			} else if (/\s/.test(char)) {
+				if (current) {
+					args.push(current);
+					current = "";
+				}
+			} else {
+				current += char;
+			}
+		}
+		if (current) args.push(current);
+		return args;
+	}
+
+	function substitutePromptArgs(content: string, args: string[]): string {
+		let result = content.replace(/\$(\d+)/g, (_match, num) => {
+			return args[Number(num) - 1] ?? "";
+		});
+		result = result.replace(/\$\{@:(\d+)(?::(\d+))?\}/g, (_match, start, length) => {
+			const startIndex = Math.max(0, Number(start) - 1);
+			return length
+				? args.slice(startIndex, startIndex + Number(length)).join(" ")
+				: args.slice(startIndex).join(" ");
+		});
+		return result
+			.replace(/\$ARGUMENTS/g, args.join(" "))
+			.replace(/\$@/g, args.join(" "));
+	}
+
+	async function expandPiPromptCommand(rawText: string): Promise<string | undefined> {
+		const commandName = parseSlashCommandName(rawText);
+		if (!commandName) return undefined;
+		const spaceIndex = rawText.indexOf(" ");
+		const argsString = spaceIndex === -1 ? "" : rawText.slice(spaceIndex + 1).trim();
+		const command = pi
+			.getCommands()
+			.find(
+				(command) =>
+					command.name === commandName &&
+					(command.source === "skill" || command.source === "prompt"),
+			);
+		if (!command) return undefined;
+		const path = command.sourceInfo.path;
+		const body = stripFrontmatter(await readFile(path, "utf8"));
+		if (command.source === "skill") {
+			const baseDir = command.sourceInfo.baseDir ?? "unknown";
+			const skillBlock = `<skill name="${command.name.replace(/^skill:/, "")}" location="${path}">\nReferences are relative to ${baseDir}.\n\n${body}\n</skill>`;
+			return argsString ? `${skillBlock}\n\n${argsString}` : skillBlock;
+		}
+		return substitutePromptArgs(body, parseCommandArgs(argsString));
+	}
+
+	async function sendTelegramCommandMenu(): Promise<void> {
+		await callTelegram<boolean>("setMyCommands", {
+			commands: [
+				{ command: "status", description: "Show pi model, usage, cost, and context" },
+				{ command: "new", description: "Start a new pi session" },
+				{ command: "compact", description: "Compact the current pi session" },
+				{ command: "stop", description: "Abort the active pi turn" },
+				{ command: "reload", description: "Reload pi resources/extensions" },
+				{ command: "telegram_verbose", description: "Show or change verbose telemetry" },
+				{ command: "help", description: "Show Telegram bridge help" },
+			],
+		});
+	}
+
+	async function enforceTelegramCommandMenu(ctx?: ExtensionContext): Promise<void> {
+		if (!getBotToken()) return;
+		try {
+			await sendTelegramCommandMenu();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx?.ui.notify(`Could not update Telegram command menu: ${message}`, "error");
 		}
 	}
 
@@ -1309,19 +1483,22 @@ export default function (pi: ExtensionAPI) {
 	async function createTelegramTurn(
 		messages: TelegramMessage[],
 		historyTurns: PendingTelegramTurn[] = [],
+		options: { passThroughCommand?: boolean; overrideText?: string } = {},
 	): Promise<PendingTelegramTurn> {
 		const firstMessage = messages[0];
 		if (!firstMessage)
 			throw new Error("Missing Telegram message for turn creation");
-		const rawText = messages
-			.map((message) => (message.text || message.caption || "").trim())
-			.filter(Boolean)
-			.join("\n\n");
+		const rawText =
+			options.overrideText ??
+			messages
+				.map((message) => (message.text || message.caption || "").trim())
+				.filter(Boolean)
+				.join("\n\n");
 		const files = await buildTelegramFiles(messages);
 		const content: Array<TextContent | ImageContent> = [];
-		let prompt = `${TELEGRAM_PREFIX}`;
+		let prompt = options.passThroughCommand ? "" : `${TELEGRAM_PREFIX}`;
 
-		if (historyTurns.length > 0) {
+		if (historyTurns.length > 0 && !options.passThroughCommand) {
 			prompt += `\n\nEarlier Telegram messages arrived after an aborted turn. Treat them as prior user messages, in order:`;
 			for (const [index, turn] of historyTurns.entries()) {
 				prompt += `\n\n${index + 1}. ${turn.historyText}`;
@@ -1330,7 +1507,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (rawText.length > 0) {
-			prompt += historyTurns.length > 0 ? `\n${rawText}` : ` ${rawText}`;
+			if (options.passThroughCommand) prompt += rawText;
+			else prompt += historyTurns.length > 0 ? `\n${rawText}` : ` ${rawText}`;
 		}
 		if (files.length > 0) {
 			prompt += `\n\nTelegram attachments were saved locally:`;
@@ -1420,6 +1598,18 @@ export default function (pi: ExtensionAPI) {
 					"No active turn.",
 				);
 			}
+			return;
+		}
+
+		if (lower === "/new") {
+			const requestId = createTelegramCommandRequest(firstMessage, rawText);
+			pi.sendUserMessage(`/telegram-new ${requestId}`);
+			return;
+		}
+
+		if (lower === "/reload") {
+			const requestId = createTelegramCommandRequest(firstMessage, rawText);
+			pi.sendUserMessage(`/telegram-reload ${requestId}`);
 			return;
 		}
 
@@ -1517,10 +1707,22 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (lower === "/help" || lower === "/start") {
+			await enforceTelegramCommandMenu(ctx);
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, /stop, /telegram-verbose on|off|status. Pairing is managed from pi with /telegram-reset-pairing.`,
+				`Send me a message and I will forward it to pi. Commands: /status, /new, /compact, /stop, /reload, /telegram_verbose on|off|status. Pi prompt templates and skills such as /skill:name are passed through to pi. Pairing is managed from pi with /telegram-reset-pairing.`,
+			);
+			return;
+		}
+
+		const expandedPromptCommand = await expandPiPromptCommand(rawText);
+		const passThroughCommand = expandedPromptCommand !== undefined;
+		if (parseSlashCommandName(rawText) && !passThroughCommand) {
+			await sendTextReply(
+				firstMessage.chat.id,
+				firstMessage.message_id,
+				`Unknown or interactive-only pi command: ${rawText}. Supported Telegram commands: /status, /new, /compact, /stop, /reload, /telegram_verbose. Skills and prompt templates are passed through, for example /skill:name ...`,
 			);
 			return;
 		}
@@ -1529,7 +1731,10 @@ export default function (pi: ExtensionAPI) {
 			? queuedTelegramTurns.splice(0)
 			: [];
 		preserveQueuedTurnsAsHistory = false;
-		const turn = await createTelegramTurn(messages, historyTurns);
+		const turn = await createTelegramTurn(messages, historyTurns, {
+			passThroughCommand,
+			overrideText: expandedPromptCommand,
+		});
 		queuedTelegramTurns.push(turn);
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
@@ -1692,6 +1897,7 @@ export default function (pi: ExtensionAPI) {
 			},
 		);
 		notifyPairingCode(ctx);
+		await enforceTelegramCommandMenu(ctx);
 		updateStatus(ctx);
 	}
 
@@ -1745,6 +1951,56 @@ export default function (pi: ExtensionAPI) {
 				],
 				details: { paths: added },
 			};
+		},
+	});
+
+	pi.registerCommand("telegram-new", {
+		description: "Start a new pi session from Telegram",
+		handler: async (args, ctx) => {
+			const request = takeTelegramCommandRequest(args.trim());
+			if (request) {
+				await sendTextReply(
+					request.chatId,
+					request.replyToMessageId,
+					"Starting a new pi session…",
+				);
+			}
+			await ctx.waitForIdle();
+			const result = await ctx.newSession({
+				parentSession: ctx.sessionManager.getSessionFile(),
+				withSession: async () => {
+					if (request) {
+						await sendTextReply(
+							request.chatId,
+							request.replyToMessageId,
+							"Started a new pi session.",
+						);
+					}
+				},
+			});
+			if (result.cancelled && request) {
+				await sendTextReply(
+					request.chatId,
+					request.replyToMessageId,
+					"New session was cancelled.",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("telegram-reload", {
+		description: "Reload pi resources/extensions from Telegram",
+		handler: async (args, ctx) => {
+			const request = takeTelegramCommandRequest(args.trim());
+			if (request) {
+				await sendTextReply(
+					request.chatId,
+					request.replyToMessageId,
+					"Reloading pi resources/extensions…",
+				);
+			}
+			await ctx.reload();
+			return;
 		},
 	});
 
@@ -1848,11 +2104,16 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
-		updateStatus(ctx);
+		if (getBotToken()) {
+			await startPolling(ctx);
+		} else {
+			updateStatus(ctx);
+		}
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		queuedTelegramTurns = [];
+		telegramCommandRequests.clear();
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
 		}
