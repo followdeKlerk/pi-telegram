@@ -1202,17 +1202,29 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function sendTelegramCommandMenu(): Promise<void> {
-		await callTelegram<boolean>("setMyCommands", {
-			commands: [
-				{ command: "status", description: "Show pi model, usage, cost, and context" },
-				{ command: "new", description: "Start a new pi session" },
-				{ command: "compact", description: "Compact the current pi session" },
-				{ command: "stop", description: "Abort the active pi turn" },
-				{ command: "reload", description: "Reload pi resources/extensions" },
-				{ command: "telegram_verbose", description: "Show or change verbose telemetry" },
-				{ command: "help", description: "Show Telegram bridge help" },
-			],
-		});
+		const commands: { command: string; description: string }[] = [
+			{ command: "status", description: "Show pi model, usage, cost, and context" },
+			{ command: "new", description: "Start a new pi session" },
+			{ command: "compact", description: "Compact the current pi session" },
+			{ command: "stop", description: "Abort the active pi turn" },
+			{ command: "reload", description: "Reload pi resources/extensions" },
+			{ command: "telegram_verbose", description: "Show or change verbose telemetry" },
+			{ command: "help", description: "Show Telegram bridge help" },
+		];
+
+		const piCommands = pi.getCommands();
+		for (const cmd of piCommands) {
+			const safeName = cmd.name.replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase().substring(0, 32);
+			if (commands.length >= 100) break;
+			if (!commands.find(c => c.command === safeName)) {
+				commands.push({
+					command: safeName,
+					description: (cmd.description || `Execute ${cmd.name}`).substring(0, 256)
+				});
+			}
+		}
+
+		await callTelegram<boolean>("setMyCommands", { commands });
 	}
 
 	async function clearTelegramCommandMenu(): Promise<void> {
@@ -1745,13 +1757,35 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const expandedPromptCommand = await expandPiPromptCommand(rawText);
-		const passThroughCommand = expandedPromptCommand !== undefined;
-		if (parseSlashCommandName(rawText) && !passThroughCommand) {
+		let resolvedRawText = rawText;
+		const parsedName = parseSlashCommandName(rawText);
+		let isKnownExtensionCommand = false;
+
+		if (parsedName) {
+			const actualCmd = pi.getCommands().find(c => 
+				c.name === parsedName || 
+				c.name.replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase().substring(0, 32) === parsedName
+			);
+			if (actualCmd) {
+				const spaceIndex = rawText.indexOf(" ");
+				if (spaceIndex === -1) {
+					resolvedRawText = `/${actualCmd.name}`;
+				} else {
+					resolvedRawText = `/${actualCmd.name}${rawText.slice(spaceIndex)}`;
+				}
+				if (actualCmd.source === "extension") {
+					isKnownExtensionCommand = true;
+				}
+			}
+		}
+
+		const expandedPromptCommand = await expandPiPromptCommand(resolvedRawText);
+		const passThroughCommand = expandedPromptCommand !== undefined || isKnownExtensionCommand;
+		if (parseSlashCommandName(resolvedRawText) && !passThroughCommand) {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Unknown or interactive-only pi command: ${rawText}. Supported Telegram commands: /status, /new, /compact, /stop, /reload, /telegram_verbose. Skills and prompt templates are passed through, for example /skill:name ...`,
+				`Unknown or interactive-only pi command: ${resolvedRawText}. Supported Telegram commands: /status, /new, /compact, /stop, /reload, /telegram_verbose. Skills and prompt templates are passed through, for example /skill:name ...`,
 			);
 			return;
 		}
@@ -1762,7 +1796,7 @@ export default function (pi: ExtensionAPI) {
 		preserveQueuedTurnsAsHistory = false;
 		const turn = await createTelegramTurn(messages, historyTurns, {
 			passThroughCommand,
-			overrideText: expandedPromptCommand,
+			overrideText: expandedPromptCommand ?? resolvedRawText,
 		});
 		queuedTelegramTurns.push(turn);
 		if (ctx.isIdle()) {
