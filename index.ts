@@ -1215,6 +1215,35 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	async function clearTelegramCommandMenu(): Promise<void> {
+		const bodies: Record<string, unknown>[] = [
+			{},
+			{ scope: { type: "default" } },
+			{ scope: { type: "all_private_chats" } },
+		];
+		if (config.allowedUserId !== undefined) {
+			bodies.push({ scope: { type: "chat", chat_id: config.allowedUserId } });
+		}
+
+		const seen = new Set<string>();
+		for (const body of bodies) {
+			const key = JSON.stringify(body);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			await callTelegram<boolean>("deleteMyCommands", body);
+		}
+
+		await callTelegram<boolean>("setChatMenuButton", {
+			menu_button: { type: "default" },
+		});
+		if (config.allowedUserId !== undefined) {
+			await callTelegram<boolean>("setChatMenuButton", {
+				chat_id: config.allowedUserId,
+				menu_button: { type: "default" },
+			});
+		}
+	}
+
 	async function enforceTelegramCommandMenu(ctx?: ExtensionContext): Promise<void> {
 		if (!getBotToken()) return;
 		try {
@@ -2052,6 +2081,27 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.notify(formatVerboseStatusReply().replace(/\n/g, " | "), "info");
+		},
+	});
+
+	pi.registerCommand("telegram-reset-menu", {
+		description: "Clear Telegram's persistent slash-command menu",
+		handler: async (_args, ctx) => {
+			config = await readConfig();
+			if (!getBotToken()) {
+				ctx.ui.notify("Telegram bot token is not configured.", "error");
+				return;
+			}
+			try {
+				await clearTelegramCommandMenu();
+				ctx.ui.notify("Telegram command menu cleared.", "info");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(
+					`Failed to clear Telegram command menu: ${message}`,
+					"error",
+				);
+			}
 		},
 	});
 

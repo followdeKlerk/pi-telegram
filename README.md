@@ -78,6 +78,14 @@ Check status, including the pairing command and lock state:
 
 The bridge auto-reconnects on session start when a bot token is configured, and refreshes the Telegram bot command menu with the supported Telegram commands.
 
+To clear Telegram's persistent slash-command menu manually:
+
+```bash
+/telegram-reset-menu
+```
+
+The menu is refreshed again the next time the bridge connects.
+
 ## Pair your Telegram account
 
 Pairing is not automatic. After token setup and `/telegram-connect`, pi shows a one-time command such as:
@@ -241,6 +249,7 @@ Token/context/tool visibility depends on what pi exposes at runtime. If a value 
 - `/telegram-disconnect` — stop polling and release the single-session lock
 - `/telegram-status` — show bot, pairing, polling, lock, and queue status
 - `/telegram-verbose on|off|status` — configure verbose Telegram telemetry
+- `/telegram-reset-menu` — clear Telegram's persistent slash-command menu
 - `/telegram-reset-pairing` — forget the allowed Telegram user and show a new pairing code
 
 ## Notes
